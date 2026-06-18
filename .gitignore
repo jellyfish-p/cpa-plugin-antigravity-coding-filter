@@ -1,0 +1,19 @@
+# Go build outputs
+*.exe
+*.test
+*.out
+coverage.out
+
+# CLIProxyAPI plugin build outputs
+*.dll
+*.so
+*.dylib
+*.h
+plugins/
+
+# Local caches and temporary files
+.worktrees/
+worktrees/
+.vscode/
+.idea/
+*.log
