@@ -9,6 +9,9 @@ coverage.out
 *.so
 *.dylib
 *.h
+*.zip
+*.zip.sha256
+dist/
 plugins/
 
 # Local caches and temporary files
