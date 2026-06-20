@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestHandlePluginCallRegisterDeclaresRouterAndExecutor(t *testing.T) {
+func TestHandlePluginCallRegisterDeclaresRequestInterceptor(t *testing.T) {
 	raw, code := handlePluginCall("plugin.register", nil)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; body=%s", code, raw)
@@ -24,55 +24,59 @@ func TestHandlePluginCallRegisterDeclaresRouterAndExecutor(t *testing.T) {
 		t.Fatalf("GitHubRepository = %#v, want %q", metadata["GitHubRepository"], pluginRepository)
 	}
 	capabilities := result["capabilities"].(map[string]any)
-	if capabilities["model_router"] != true {
-		t.Fatalf("model_router = %#v, want true", capabilities["model_router"])
+	if capabilities["model_router"] == true {
+		t.Fatalf("model_router = %#v, want false", capabilities["model_router"])
 	}
-	if capabilities["executor"] != true {
-		t.Fatalf("executor = %#v, want true", capabilities["executor"])
+	if capabilities["executor"] == true {
+		t.Fatalf("executor = %#v, want false", capabilities["executor"])
+	}
+	if capabilities["request_interceptor"] != true {
+		t.Fatalf("request_interceptor = %#v, want true", capabilities["request_interceptor"])
 	}
 	fields := result["metadata"].(map[string]any)["ConfigFields"].([]any)
 	if !hasConfigField(fields, "use_default_keywords", "boolean") {
 		t.Fatalf("ConfigFields = %#v, want boolean use_default_keywords", fields)
 	}
-	if !hasConfigField(fields, "custom_keywords", "array") {
-		t.Fatalf("ConfigFields = %#v, want array custom_keywords", fields)
+	if !hasConfigField(fields, "custom_mappings", "object") {
+		t.Fatalf("ConfigFields = %#v, want object custom_mappings", fields)
 	}
 }
 
-func TestHandlePluginCallReconfigureAppliesCustomKeywordsAndDefaultToggle(t *testing.T) {
+func TestHandlePluginCallReconfigureAppliesCustomMappingsAndDefaultToggle(t *testing.T) {
 	defer restoreDefaultFilterConfig(t)
 
 	raw, code := handlePluginCall("plugin.reconfigure", lifecycleRequestJSON(t, []byte(`
 enabled: true
 priority: 1
 use_default_keywords: false
-custom_keywords:
-  - Cursor
-  - Windsurf
+custom_mappings:
+  Cursor: Antigravity
+  Windsurf: Antigravity
 `)))
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; body=%s", code, raw)
 	}
 
-	if got := classifyRequest([]byte(`{"system":"You are Codex."}`)); got.Blocked {
-		t.Fatalf("Codex blocked after disabling defaults; signal=%q", got.Signal)
+	if got, rewritten := rewriteRequestBody([]byte(`{"system":"You are Codex."}`)); rewritten {
+		t.Fatalf("Codex rewritten after disabling defaults; body=%s", got)
 	}
-	got := classifyRequest([]byte(`{"system":"route this Cursor session"}`))
-	if !got.Blocked {
-		t.Fatalf("Cursor blocked = false, want true")
+	got, rewritten := rewriteRequestBody([]byte(`{"system":"route this Cursor session"}`))
+	if !rewritten {
+		t.Fatalf("Cursor rewritten = false, want true")
 	}
-	if got.Detail != "cursor" {
-		t.Fatalf("Detail = %q, want cursor", got.Detail)
+	if !strings.Contains(string(got), "route this Antigravity session") {
+		t.Fatalf("body = %s, want Cursor replaced with Antigravity", got)
 	}
 }
 
-func TestHandlePluginCallReconfigureAcceptsDelimitedCustomKeywords(t *testing.T) {
+func TestHandlePluginCallReconfigureAcceptsDelimitedCustomMappings(t *testing.T) {
 	defer restoreDefaultFilterConfig(t)
 
 	raw, code := handlePluginCall("plugin.reconfigure", lifecycleRequestJSON(t, []byte(`
-custom_keywords: |
-  Cursor, Windsurf
-  JetBrains AI
+custom_mappings: |
+  Cursor: Antigravity
+  Windsurf: Antigravity
+  JetBrains AI: Antigravity
 `)))
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; body=%s", code, raw)
@@ -81,9 +85,12 @@ custom_keywords: |
 	tests := []string{"Cursor", "Windsurf", "JetBrains AI"}
 	for _, keyword := range tests {
 		t.Run(keyword, func(t *testing.T) {
-			got := classifyRequest([]byte(`{"system":"route this ` + keyword + ` session"}`))
-			if !got.Blocked {
-				t.Fatalf("%s blocked = false, want true", keyword)
+			got, rewritten := rewriteRequestBody([]byte(`{"system":"route this ` + keyword + ` session"}`))
+			if !rewritten {
+				t.Fatalf("%s rewritten = false, want true", keyword)
+			}
+			if !strings.Contains(string(got), "Antigravity") {
+				t.Fatalf("body = %s, want replacement", got)
 			}
 		})
 	}
@@ -94,16 +101,16 @@ func TestHandlePluginCallReconfigureKeepsPreviousConfigOnInvalidInput(t *testing
 
 	raw, code := handlePluginCall("plugin.reconfigure", lifecycleRequestJSON(t, []byte(`
 use_default_keywords: false
-custom_keywords:
-  - Cursor
+custom_mappings:
+  Cursor: Antigravity
 `)))
 	if code != 0 {
 		t.Fatalf("initial reconfigure code = %d, want 0; body=%s", code, raw)
 	}
 
 	raw, code = handlePluginCall("plugin.reconfigure", lifecycleRequestJSON(t, []byte(`
-custom_keywords:
-  nested: invalid
+custom_mappings:
+  - nested: invalid
 `)))
 	if code != 0 {
 		t.Fatalf("invalid reconfigure code = %d, want 0 handled error envelope; body=%s", code, raw)
@@ -123,18 +130,18 @@ custom_keywords:
 		t.Fatalf("error code = %q, want invalid_config", envelope.Error.Code)
 	}
 
-	if got := classifyRequest([]byte(`{"system":"route this Cursor session"}`)); !got.Blocked {
-		t.Fatalf("Cursor blocked = false after invalid config, want previous config retained")
+	if _, rewritten := rewriteRequestBody([]byte(`{"system":"route this Cursor session"}`)); !rewritten {
+		t.Fatalf("Cursor rewritten = false after invalid config, want previous config retained")
 	}
-	if got := classifyRequest([]byte(`{"system":"You are Codex."}`)); got.Blocked {
-		t.Fatalf("Codex blocked after invalid config, want previous disabled-default state retained")
+	if got, rewritten := rewriteRequestBody([]byte(`{"system":"You are Codex."}`)); rewritten {
+		t.Fatalf("Codex rewritten after invalid config, want previous disabled-default state retained; body=%s", got)
 	}
 }
 
-func TestHandlePluginCallModelRouteBlocksCodingSignals(t *testing.T) {
-	request := modelRouteRequestJSON(t, `{"system":"You are Codex.","messages":[]}`)
+func TestHandlePluginCallRequestInterceptBeforeRewritesCodingSignals(t *testing.T) {
+	request := requestInterceptRequestJSON(t, `{"system":"You are Codex.","messages":[]}`)
 
-	raw, code := handlePluginCall("model.route", request)
+	raw, code := handlePluginCall("request.intercept_before", request)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; body=%s", code, raw)
 	}
@@ -142,80 +149,26 @@ func TestHandlePluginCallModelRouteBlocksCodingSignals(t *testing.T) {
 	var envelope struct {
 		OK     bool `json:"ok"`
 		Result struct {
-			Handled    bool   `json:"Handled"`
-			TargetKind string `json:"TargetKind"`
-			Reason     string `json:"Reason"`
+			Body string `json:"Body"`
 		} `json:"result"`
 	}
 	mustUnmarshalJSON(t, raw, &envelope)
 	if !envelope.OK {
 		t.Fatalf("ok = false, want true")
 	}
-	if !envelope.Result.Handled {
-		t.Fatalf("Handled = false, want true")
-	}
-	if envelope.Result.TargetKind != "self" {
-		t.Fatalf("TargetKind = %q, want self", envelope.Result.TargetKind)
-	}
-	if !strings.Contains(envelope.Result.Reason, "system.keyword") {
-		t.Fatalf("Reason = %q, want system.keyword detail", envelope.Result.Reason)
-	}
-}
-
-func TestHandlePluginCallModelRoutePassesCleanRequests(t *testing.T) {
-	request := modelRouteRequestJSON(t, `{"system":"You are Antigravity.","messages":[]}`)
-
-	raw, code := handlePluginCall("model.route", request)
-	if code != 0 {
-		t.Fatalf("code = %d, want 0; body=%s", code, raw)
-	}
-
-	var envelope struct {
-		OK     bool `json:"ok"`
-		Result struct {
-			Handled bool `json:"Handled"`
-		} `json:"result"`
-	}
-	mustUnmarshalJSON(t, raw, &envelope)
-	if !envelope.OK {
-		t.Fatalf("ok = false, want true")
-	}
-	if envelope.Result.Handled {
-		t.Fatalf("Handled = true, want false")
-	}
-}
-
-func TestHandlePluginCallExecutorExecuteReturnsBlockPayload(t *testing.T) {
-	raw, code := handlePluginCall("executor.execute", []byte(`{"Model":"antigravity/test"}`))
-	if code != 0 {
-		t.Fatalf("code = %d, want 0; body=%s", code, raw)
-	}
-
-	var envelope struct {
-		OK     bool `json:"ok"`
-		Result struct {
-			Payload string              `json:"Payload"`
-			Headers map[string][]string `json:"Headers"`
-		} `json:"result"`
-	}
-	mustUnmarshalJSON(t, raw, &envelope)
-	if !envelope.OK {
-		t.Fatalf("ok = false, want true")
-	}
-	payload, err := base64.StdEncoding.DecodeString(envelope.Result.Payload)
+	body, err := base64.StdEncoding.DecodeString(envelope.Result.Body)
 	if err != nil {
-		t.Fatalf("decode payload: %v", err)
+		t.Fatalf("decode body: %v", err)
 	}
-	if !strings.Contains(string(payload), "blocked_by_antigravity_coding_filter") {
-		t.Fatalf("payload = %s, want blocked error", payload)
-	}
-	if got := envelope.Result.Headers["content-type"][0]; got != "application/json" {
-		t.Fatalf("content-type = %q, want application/json", got)
+	if !strings.Contains(string(body), "You are Antigravity.") {
+		t.Fatalf("body = %s, want rewritten system", body)
 	}
 }
 
-func TestHandlePluginCallExecutorExecuteStreamReturnsBlockChunk(t *testing.T) {
-	raw, code := handlePluginCall("executor.execute_stream", []byte(`{"Model":"antigravity/test"}`))
+func TestHandlePluginCallRequestInterceptBeforePassesCleanRequests(t *testing.T) {
+	request := requestInterceptRequestJSON(t, `{"system":"You are Antigravity.","messages":[]}`)
+
+	raw, code := handlePluginCall("request.intercept_before", request)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; body=%s", code, raw)
 	}
@@ -223,25 +176,15 @@ func TestHandlePluginCallExecutorExecuteStreamReturnsBlockChunk(t *testing.T) {
 	var envelope struct {
 		OK     bool `json:"ok"`
 		Result struct {
-			Headers map[string][]string `json:"Headers"`
-			Chunks  []struct {
-				Payload string `json:"Payload"`
-			} `json:"Chunks"`
+			Body string `json:"Body"`
 		} `json:"result"`
 	}
 	mustUnmarshalJSON(t, raw, &envelope)
 	if !envelope.OK {
 		t.Fatalf("ok = false, want true")
 	}
-	if len(envelope.Result.Chunks) != 1 {
-		t.Fatalf("len(Chunks) = %d, want 1", len(envelope.Result.Chunks))
-	}
-	chunk, err := base64.StdEncoding.DecodeString(envelope.Result.Chunks[0].Payload)
-	if err != nil {
-		t.Fatalf("decode chunk: %v", err)
-	}
-	if !strings.Contains(string(chunk), "blocked_by_antigravity_coding_filter") {
-		t.Fatalf("chunk = %s, want blocked error", chunk)
+	if envelope.Result.Body != "" {
+		t.Fatalf("Body = %q, want empty body to keep original request", envelope.Result.Body)
 	}
 }
 
@@ -266,15 +209,17 @@ func TestHandlePluginCallUnknownMethodReturnsErrorEnvelope(t *testing.T) {
 	}
 }
 
-func modelRouteRequestJSON(t *testing.T, body string) []byte {
+func requestInterceptRequestJSON(t *testing.T, body string) []byte {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{
 		"SourceFormat":   "openai",
+		"ToFormat":       "",
+		"Model":          "antigravity/test",
 		"RequestedModel": "antigravity/test",
 		"Body":           []byte(body),
 	})
 	if err != nil {
-		t.Fatalf("marshal model route request: %v", err)
+		t.Fatalf("marshal request intercept request: %v", err)
 	}
 	return raw
 }

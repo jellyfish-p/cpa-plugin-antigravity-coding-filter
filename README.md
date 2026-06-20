@@ -1,20 +1,22 @@
 # Antigravity Coding Filter
 
-CLIProxyAPI v7 dynamic plugin for protecting the Antigravity route from non-Antigravity coding software traffic.
+CLIProxyAPI v7 dynamic plugin for rewriting non-Antigravity coding software signals to Antigravity.
 
-## Detection Rules
+## Rewrite Rules
 
-The plugin blocks a request when its JSON body contains any of these signals:
+The plugin rewrites configured coding-client names when they appear inside JSON fields named `system`.
 
-- `system` contains one of: `OpenCode`, `Codex`, `Claude Code`
-- any JSON object contains `prompt_cache_key`
-- any JSON object contains `metadata.user_id`
+The built-in mapping preset is enabled by default:
 
-Keyword matching is case-insensitive and only scans `system`. Mentions in user prompts, `messages`, or other fields do not block by themselves.
+- `OpenCode` -> `Antigravity`
+- `Codex` -> `Antigravity`
+- `Claude Code` -> `Antigravity`
 
-## Keyword Configuration
+Matching is case-insensitive and only scans `system`. Mentions in user prompts, `messages`, or other fields are not rewritten.
 
-The built-in keyword preset is enabled by default. You can disable it and provide your own keywords in the plugin config:
+## Mapping Configuration
+
+You can disable the built-in preset and provide your own mapping relationships in the plugin config:
 
 ```yaml
 plugins:
@@ -23,13 +25,13 @@ plugins:
       enabled: true
       priority: 1
       use_default_keywords: false
-      custom_keywords:
-        - Cursor
-        - Windsurf
-        - JetBrains AI
+      custom_mappings:
+        Cursor: Antigravity
+        Windsurf: Antigravity
+        JetBrains AI: Antigravity
 ```
 
-`custom_keywords` also accepts a comma- or newline-delimited string for simpler one-line config. Blank entries and duplicates are ignored.
+`custom_mappings` also accepts a comma- or newline-delimited `from: to` string for simpler one-line config. Blank entries and duplicate source names are ignored.
 
 ## Build
 
@@ -55,7 +57,7 @@ plugins:
       enabled: true
       priority: 1
       use_default_keywords: true
-      custom_keywords: []
+      custom_mappings: {}
 ```
 
 CLIProxyAPI searches `plugins/<GOOS>/<GOARCH>-<variant>`, then `plugins/<GOOS>/<GOARCH>`, then `plugins`.

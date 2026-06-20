@@ -1,90 +1,59 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
-func TestClassifyRequestBlocksSystemKeywords(t *testing.T) {
+func TestRewriteRequestReplacesDefaultSystemKeywords(t *testing.T) {
 	tests := []struct {
 		name string
 		body string
+		want string
 	}{
 		{
 			name: "string system mentions opencode",
 			body: `{"system":"You are OpenCode, an AI coding tool."}`,
+			want: "You are Antigravity, an AI coding tool.",
 		},
 		{
 			name: "array system mentions claude code",
 			body: `{"system":[{"type":"text","text":"Run as Claude Code."}]}`,
+			want: "Run as Antigravity.",
 		},
 		{
 			name: "case insensitive codex",
 			body: `{"system":"route this CODEX session"}`,
+			want: "route this Antigravity session",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := classifyRequest([]byte(tt.body))
-			if !got.Blocked {
-				t.Fatalf("Blocked = false, want true")
+			got, rewritten := rewriteRequestBody([]byte(tt.body))
+			if !rewritten {
+				t.Fatalf("rewritten = false, want true")
 			}
-			if got.Signal == "" {
-				t.Fatalf("Signal is empty")
+			if !containsSystemText(t, got, tt.want) {
+				t.Fatalf("rewritten body = %s, want system text %q", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestClassifyRequestIgnoresKeywordsOutsideSystem(t *testing.T) {
-	got := classifyRequest([]byte(`{
+func TestRewriteRequestIgnoresKeywordsOutsideSystem(t *testing.T) {
+	body := []byte(`{
 		"messages":[{"role":"user","content":"please compare OpenCode and Codex"}],
 		"input":"Claude Code is mentioned by the user"
-	}`))
-	if got.Blocked {
-		t.Fatalf("Blocked = true, want false; signal=%q", got.Signal)
+	}`)
+	got, rewritten := rewriteRequestBody(body)
+	if rewritten {
+		t.Fatalf("rewritten = true, want false; body=%s", got)
 	}
 }
 
-func TestClassifyRequestBlocksPromptCacheKey(t *testing.T) {
-	got := classifyRequest([]byte(`{"prompt_cache_key":"session-cache","system":"plain"}`))
-	if !got.Blocked {
-		t.Fatalf("Blocked = false, want true")
-	}
-	if got.Signal != "prompt_cache_key" {
-		t.Fatalf("Signal = %q, want prompt_cache_key", got.Signal)
-	}
-}
-
-func TestClassifyRequestBlocksNestedPromptCacheKey(t *testing.T) {
-	got := classifyRequest([]byte(`{"request":{"prompt_cache_key":"session-cache"},"system":"plain"}`))
-	if !got.Blocked {
-		t.Fatalf("Blocked = false, want true")
-	}
-	if got.Signal != "prompt_cache_key" {
-		t.Fatalf("Signal = %q, want prompt_cache_key", got.Signal)
-	}
-}
-
-func TestClassifyRequestBlocksMetadataUserID(t *testing.T) {
-	got := classifyRequest([]byte(`{"metadata":{"user_id":"user-123"},"system":"plain"}`))
-	if !got.Blocked {
-		t.Fatalf("Blocked = false, want true")
-	}
-	if got.Signal != "metadata.user_id" {
-		t.Fatalf("Signal = %q, want metadata.user_id", got.Signal)
-	}
-}
-
-func TestClassifyRequestBlocksNestedMetadataUserID(t *testing.T) {
-	got := classifyRequest([]byte(`{"request":{"metadata":{"user_id":"user-123"}},"system":"plain"}`))
-	if !got.Blocked {
-		t.Fatalf("Blocked = false, want true")
-	}
-	if got.Signal != "metadata.user_id" {
-		t.Fatalf("Signal = %q, want metadata.user_id", got.Signal)
-	}
-}
-
-func TestClassifyRequestAllowsCleanAndInvalidBodies(t *testing.T) {
+func TestRewriteRequestAllowsCleanInvalidAndStructuralBodies(t *testing.T) {
 	tests := []struct {
 		name string
 		body string
@@ -101,14 +70,41 @@ func TestClassifyRequestAllowsCleanAndInvalidBodies(t *testing.T) {
 			name: "empty body",
 			body: ``,
 		},
+		{
+			name: "prompt cache key",
+			body: `{"prompt_cache_key":"session-cache","system":"plain"}`,
+		},
+		{
+			name: "metadata user id",
+			body: `{"metadata":{"user_id":"user-123"},"system":"plain"}`,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := classifyRequest([]byte(tt.body))
-			if got.Blocked {
-				t.Fatalf("Blocked = true, want false; signal=%q", got.Signal)
+			got, rewritten := rewriteRequestBody([]byte(tt.body))
+			if rewritten {
+				t.Fatalf("rewritten = true, want false; body=%s", got)
 			}
 		})
 	}
+}
+
+func containsSystemText(t *testing.T, body []byte, want string) bool {
+	t.Helper()
+
+	var root any
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("decode rewritten body: %v", err)
+	}
+
+	found := false
+	walkJSON(root, func(path []string, value any) bool {
+		if len(path) == 0 || path[len(path)-1] != "system" {
+			return true
+		}
+		found = strings.Contains(collectText(value), want)
+		return !found
+	})
+	return found
 }

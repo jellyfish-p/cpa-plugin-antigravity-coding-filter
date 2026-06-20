@@ -40,7 +40,6 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync"
 	"unsafe"
@@ -117,39 +116,16 @@ func writeCResponse(response *C.cliproxy_buffer, raw []byte) {
 	response.len = C.size_t(len(raw))
 }
 
-type executorStreamResponse struct {
-	Headers http.Header           `json:"Headers,omitempty"`
-	Chunks  []executorStreamChunk `json:"Chunks,omitempty"`
-}
-
-type executorStreamChunk struct {
-	Payload []byte `json:"Payload"`
-}
-
 func handlePluginCall(method string, request []byte) ([]byte, int) {
 	switch method {
 	case pluginabi.MethodPluginRegister:
 		return handlePluginLifecycle(request), 0
 	case pluginabi.MethodPluginReconfigure:
 		return handlePluginLifecycle(request), 0
-	case pluginabi.MethodModelRoute:
-		return handleModelRoute(request), 0
-	case pluginabi.MethodExecutorExecute, pluginabi.MethodExecutorCountTokens:
-		return mustEnvelope(pluginapi.ExecutorResponse{
-			Payload: blockPayload(),
-			Headers: jsonHeaders(),
-		}), 0
-	case pluginabi.MethodExecutorHTTPRequest:
-		return mustEnvelope(pluginapi.ExecutorHTTPResponse{
-			StatusCode: http.StatusForbidden,
-			Body:       blockPayload(),
-			Headers:    jsonHeaders(),
-		}), 0
-	case pluginabi.MethodExecutorExecuteStream:
-		return mustEnvelope(executorStreamResponse{
-			Headers: jsonHeaders(),
-			Chunks:  []executorStreamChunk{{Payload: blockPayload()}},
-		}), 0
+	case pluginabi.MethodRequestInterceptBefore:
+		return handleRequestInterceptBefore(request), 0
+	case pluginabi.MethodRequestInterceptAfter:
+		return mustEnvelope(pluginapi.RequestInterceptResponse{}), 0
 	default:
 		return mustErrorEnvelope("unknown_method", fmt.Sprintf("unknown method %q", method)), 0
 	}
@@ -171,11 +147,9 @@ func registrationResponse() any {
 		SchemaVersion uint32             `json:"schema_version"`
 		Metadata      pluginapi.Metadata `json:"metadata"`
 		Capabilities  struct {
-			ModelRouter           bool                         `json:"model_router"`
-			Executor              bool                         `json:"executor"`
-			ExecutorModelScope    pluginapi.ExecutorModelScope `json:"executor_model_scope"`
-			ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
-			ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
+			ModelRouter        bool `json:"model_router"`
+			Executor           bool `json:"executor"`
+			RequestInterceptor bool `json:"request_interceptor"`
 		} `json:"capabilities"`
 	}{
 		SchemaVersion: pluginabi.SchemaVersion,
@@ -188,17 +162,11 @@ func registrationResponse() any {
 			ConfigFields:     configFields(),
 		},
 		Capabilities: struct {
-			ModelRouter           bool                         `json:"model_router"`
-			Executor              bool                         `json:"executor"`
-			ExecutorModelScope    pluginapi.ExecutorModelScope `json:"executor_model_scope"`
-			ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
-			ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
+			ModelRouter        bool `json:"model_router"`
+			Executor           bool `json:"executor"`
+			RequestInterceptor bool `json:"request_interceptor"`
 		}{
-			ModelRouter:           true,
-			Executor:              true,
-			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
-			ExecutorInputFormats:  []string{"chat-completions", "responses", "anthropic", "gemini"},
-			ExecutorOutputFormats: []string{"chat-completions", "responses", "anthropic", "gemini"},
+			RequestInterceptor: true,
 		},
 	}
 }
@@ -208,51 +176,27 @@ func configFields() []pluginapi.ConfigField {
 		{
 			Name:        "use_default_keywords",
 			Type:        pluginapi.ConfigFieldTypeBoolean,
-			Description: "Enable the built-in coding client keyword preset: OpenCode, Codex, Claude Code.",
+			Description: "Enable the built-in rewrite mapping preset: OpenCode, Codex, Claude Code -> Antigravity.",
 		},
 		{
-			Name:        "custom_keywords",
-			Type:        pluginapi.ConfigFieldTypeArray,
-			Description: "Additional case-insensitive keywords to block when they appear in the system field.",
+			Name:        "custom_mappings",
+			Type:        pluginapi.ConfigFieldTypeObject,
+			Description: "Additional case-insensitive system-field rewrite mappings, for example Cursor: Antigravity.",
 		},
 	}
 }
 
-func handleModelRoute(request []byte) []byte {
-	var req pluginapi.ModelRouteRequest
+func handleRequestInterceptBefore(request []byte) []byte {
+	var req pluginapi.RequestInterceptRequest
 	if err := json.Unmarshal(request, &req); err != nil {
-		return mustErrorEnvelope("invalid_request", fmt.Sprintf("decode model.route request: %v", err))
+		return mustErrorEnvelope("invalid_request", fmt.Sprintf("decode request.intercept_before request: %v", err))
 	}
 
-	decision := classifyRequest(req.Body)
-	if !decision.Blocked {
-		return mustEnvelope(pluginapi.ModelRouteResponse{Handled: false})
+	body, rewritten := rewriteRequestBody(req.Body)
+	if !rewritten {
+		return mustEnvelope(pluginapi.RequestInterceptResponse{})
 	}
-
-	return mustEnvelope(pluginapi.ModelRouteResponse{
-		Handled:    true,
-		TargetKind: pluginapi.ModelRouteTargetSelf,
-		Reason:     fmt.Sprintf("%s:%s", decision.Signal, decision.Detail),
-	})
-}
-
-func blockPayload() []byte {
-	payload := map[string]any{
-		"error": map[string]any{
-			"code":    "blocked_by_antigravity_coding_filter",
-			"message": "request blocked because it matches non-Antigravity coding software signals",
-			"type":    "invalid_request_error",
-		},
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return []byte(`{"error":{"code":"blocked_by_antigravity_coding_filter"}}`)
-	}
-	return raw
-}
-
-func jsonHeaders() http.Header {
-	return http.Header{"content-type": []string{"application/json"}}
+	return mustEnvelope(pluginapi.RequestInterceptResponse{Body: body})
 }
 
 func mustEnvelope(result any) []byte {
@@ -279,15 +223,20 @@ func mustRawMessage(value any) json.RawMessage {
 	return raw
 }
 
-var defaultCodingKeywords = []string{
-	"opencode",
-	"codex",
-	"claude code",
+var defaultRewriteMappings = []rewriteMapping{
+	{Match: "opencode", Replacement: "Antigravity"},
+	{Match: "codex", Replacement: "Antigravity"},
+	{Match: "claude code", Replacement: "Antigravity"},
+}
+
+type rewriteMapping struct {
+	Match       string
+	Replacement string
 }
 
 type filterConfig struct {
 	UseDefaultKeywords bool
-	CustomKeywords     []string
+	CustomMappings     []rewriteMapping
 }
 
 var (
@@ -305,7 +254,7 @@ func applyFilterConfig(cfg filterConfig) {
 
 	currentFilterConfig = filterConfig{
 		UseDefaultKeywords: cfg.UseDefaultKeywords,
-		CustomKeywords:     append([]string(nil), normalizeKeywords(cfg.CustomKeywords)...),
+		CustomMappings:     append([]rewriteMapping(nil), normalizeMappings(cfg.CustomMappings)...),
 	}
 }
 
@@ -315,7 +264,7 @@ func activeFilterConfig() filterConfig {
 
 	return filterConfig{
 		UseDefaultKeywords: currentFilterConfig.UseDefaultKeywords,
-		CustomKeywords:     append([]string(nil), currentFilterConfig.CustomKeywords...),
+		CustomMappings:     append([]rewriteMapping(nil), currentFilterConfig.CustomMappings...),
 	}
 }
 
@@ -348,120 +297,213 @@ func parseFilterConfigYAML(raw []byte) (filterConfig, error) {
 		}
 		cfg.UseDefaultKeywords = boolValue
 	}
-	if value, exists := values["custom_keywords"]; exists {
-		keywords, err := parseCustomKeywords(value)
+	if value, exists := values["custom_mappings"]; exists {
+		mappings, err := parseCustomMappings(value)
 		if err != nil {
 			return filterConfig{}, err
 		}
-		cfg.CustomKeywords = keywords
+		cfg.CustomMappings = mappings
 	}
 	return cfg, nil
 }
 
-func parseCustomKeywords(value any) ([]string, error) {
+func parseCustomMappings(value any) ([]rewriteMapping, error) {
 	switch typed := value.(type) {
 	case nil:
 		return nil, nil
 	case string:
-		return splitKeywordString(typed), nil
+		return parseMappingString(typed)
+	case map[string]any:
+		mappings := make([]rewriteMapping, 0, len(typed))
+		for match, replacement := range typed {
+			text, ok := replacement.(string)
+			if !ok {
+				return nil, fmt.Errorf("custom_mappings values must be strings")
+			}
+			mappings = append(mappings, rewriteMapping{Match: match, Replacement: text})
+		}
+		return mappings, nil
 	case []any:
-		keywords := make([]string, 0, len(typed))
+		mappings := make([]rewriteMapping, 0, len(typed))
 		for _, item := range typed {
 			text, ok := item.(string)
 			if !ok {
-				return nil, fmt.Errorf("custom_keywords entries must be strings")
+				return nil, fmt.Errorf("custom_mappings entries must be strings")
 			}
-			keywords = append(keywords, text)
+			parsed, err := parseMappingString(text)
+			if err != nil {
+				return nil, err
+			}
+			mappings = append(mappings, parsed...)
 		}
-		return keywords, nil
+		return mappings, nil
 	default:
-		return nil, fmt.Errorf("custom_keywords must be an array or string")
+		return nil, fmt.Errorf("custom_mappings must be an object, array, or string")
 	}
 }
 
-func splitKeywordString(value string) []string {
-	fields := strings.FieldsFunc(value, func(r rune) bool {
+func parseMappingString(value string) ([]rewriteMapping, error) {
+	entries := strings.FieldsFunc(value, func(r rune) bool {
 		return r == ',' || r == '\n' || r == '\r'
 	})
-	return fields
-}
-
-func effectiveKeywords(cfg filterConfig) []string {
-	keywords := make([]string, 0, len(defaultCodingKeywords)+len(cfg.CustomKeywords))
-	if cfg.UseDefaultKeywords {
-		keywords = append(keywords, defaultCodingKeywords...)
+	mappings := make([]rewriteMapping, 0, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		match, replacement, ok := strings.Cut(entry, ":")
+		if !ok {
+			return nil, fmt.Errorf("custom_mappings entries must use match: replacement")
+		}
+		mappings = append(mappings, rewriteMapping{Match: match, Replacement: replacement})
 	}
-	keywords = append(keywords, cfg.CustomKeywords...)
-	return normalizeKeywords(keywords)
+	return mappings, nil
 }
 
-func normalizeKeywords(keywords []string) []string {
-	seen := make(map[string]struct{}, len(keywords))
-	out := make([]string, 0, len(keywords))
-	for _, keyword := range keywords {
-		normalized := strings.ToLower(strings.TrimSpace(keyword))
-		if normalized == "" {
+func effectiveMappings(cfg filterConfig) []rewriteMapping {
+	mappings := make([]rewriteMapping, 0, len(defaultRewriteMappings)+len(cfg.CustomMappings))
+	if cfg.UseDefaultKeywords {
+		mappings = append(mappings, defaultRewriteMappings...)
+	}
+	mappings = append(mappings, cfg.CustomMappings...)
+	return normalizeMappings(mappings)
+}
+
+func normalizeMappings(mappings []rewriteMapping) []rewriteMapping {
+	seen := make(map[string]struct{}, len(mappings))
+	reversed := make([]rewriteMapping, 0, len(mappings))
+	for i := len(mappings) - 1; i >= 0; i-- {
+		match := strings.ToLower(strings.TrimSpace(mappings[i].Match))
+		replacement := strings.TrimSpace(mappings[i].Replacement)
+		if match == "" || replacement == "" {
 			continue
 		}
-		if _, exists := seen[normalized]; exists {
+		if _, exists := seen[match]; exists {
 			continue
 		}
-		seen[normalized] = struct{}{}
-		out = append(out, normalized)
+		seen[match] = struct{}{}
+		reversed = append(reversed, rewriteMapping{Match: match, Replacement: replacement})
+	}
+	out := make([]rewriteMapping, 0, len(reversed))
+	for i := len(reversed) - 1; i >= 0; i-- {
+		out = append(out, reversed[i])
 	}
 	return out
 }
 
-type filterDecision struct {
-	Blocked bool
-	Signal  string
-	Detail  string
-}
-
-func classifyRequest(body []byte) filterDecision {
+func rewriteRequestBody(body []byte) ([]byte, bool) {
 	var root any
 	if err := json.Unmarshal(body, &root); err != nil {
-		return filterDecision{}
+		return nil, false
 	}
-	return classifyJSON(root, activeFilterConfig())
+	rewritten, changed := rewriteSystemFields(root, effectiveMappings(activeFilterConfig()))
+	if !changed {
+		return nil, false
+	}
+	raw, err := json.Marshal(rewritten)
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
 }
 
-func classifyJSON(root any, cfg filterConfig) filterDecision {
-	var decision filterDecision
-	keywords := effectiveKeywords(cfg)
-	walkJSON(root, func(path []string, value any) bool {
-		key := ""
-		if len(path) > 0 {
-			key = path[len(path)-1]
-		}
-
-		if key == "prompt_cache_key" {
-			decision = filterDecision{Blocked: true, Signal: "prompt_cache_key", Detail: strings.Join(path, ".")}
-			return false
-		}
-
-		if key == "metadata" {
-			if object, ok := value.(map[string]any); ok {
-				if _, exists := object["user_id"]; exists {
-					decision = filterDecision{Blocked: true, Signal: "metadata.user_id", Detail: strings.Join(append(path, "user_id"), ".")}
-					return false
+func rewriteSystemFields(value any, mappings []rewriteMapping) (any, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		changed := false
+		for key, child := range typed {
+			if key == "system" {
+				next, childChanged := rewriteSystemValue(child, mappings)
+				if childChanged {
+					typed[key] = next
+					changed = true
 				}
+				continue
+			}
+			next, childChanged := rewriteSystemFields(child, mappings)
+			if childChanged {
+				typed[key] = next
+				changed = true
 			}
 		}
-
-		if key == "system" {
-			text := strings.ToLower(collectText(value))
-			for _, keyword := range keywords {
-				if strings.Contains(text, keyword) {
-					decision = filterDecision{Blocked: true, Signal: "system.keyword", Detail: keyword}
-					return false
-				}
+		return typed, changed
+	case []any:
+		changed := false
+		for i, child := range typed {
+			next, childChanged := rewriteSystemFields(child, mappings)
+			if childChanged {
+				typed[i] = next
+				changed = true
 			}
 		}
+		return typed, changed
+	default:
+		return value, false
+	}
+}
 
-		return true
-	})
-	return decision
+func rewriteSystemValue(value any, mappings []rewriteMapping) (any, bool) {
+	switch typed := value.(type) {
+	case string:
+		next := typed
+		changed := false
+		for _, mapping := range mappings {
+			var replaced bool
+			next, replaced = replaceInsensitive(next, mapping.Match, mapping.Replacement)
+			changed = changed || replaced
+		}
+		return next, changed
+	case map[string]any:
+		changed := false
+		for key, child := range typed {
+			next, childChanged := rewriteSystemValue(child, mappings)
+			if childChanged {
+				typed[key] = next
+				changed = true
+			}
+		}
+		return typed, changed
+	case []any:
+		changed := false
+		for i, child := range typed {
+			next, childChanged := rewriteSystemValue(child, mappings)
+			if childChanged {
+				typed[i] = next
+				changed = true
+			}
+		}
+		return typed, changed
+	default:
+		return value, false
+	}
+}
+
+func replaceInsensitive(value, match, replacement string) (string, bool) {
+	if match == "" {
+		return value, false
+	}
+	lowerValue := strings.ToLower(value)
+	lowerMatch := strings.ToLower(match)
+	var builder strings.Builder
+	start := 0
+	changed := false
+	for {
+		index := strings.Index(lowerValue[start:], lowerMatch)
+		if index < 0 {
+			break
+		}
+		index += start
+		builder.WriteString(value[start:index])
+		builder.WriteString(replacement)
+		start = index + len(match)
+		changed = true
+	}
+	if !changed {
+		return value, false
+	}
+	builder.WriteString(value[start:])
+	return builder.String(), true
 }
 
 func walkJSON(value any, visit func(path []string, value any) bool) {
