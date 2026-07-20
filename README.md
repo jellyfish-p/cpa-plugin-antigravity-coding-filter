@@ -1,22 +1,33 @@
 # Antigravity Coding Filter
 
-CLIProxyAPI v7 dynamic plugin for rewriting non-Antigravity coding software signals to Antigravity.
+CLIProxyAPI v7 dynamic plugin for blocking or rewriting non-Antigravity coding software signals.
 
-## Rewrite Rules
+## Filter Modes
 
-The plugin rewrites configured coding-client names when they appear inside JSON fields named `system`.
+The plugin detects configured coding-client names when they appear inside JSON fields named `system`. Choose how matches are handled with `mode`:
 
-The built-in mapping preset is enabled by default:
+- `block` (default): reject the entire request with a `blocked_by_antigravity_coding_filter` error.
+- `rewrite`: replace matched names with `Antigravity` and forward the request.
 
-- `OpenCode` -> `Antigravity`
-- `Codex` -> `Antigravity`
-- `Claude Code` -> `Antigravity`
+Matching is case-insensitive and only scans `system`. Mentions in user prompts, `messages`, or other fields do not trigger the filter.
 
-Matching is case-insensitive and only scans `system`. Mentions in user prompts, `messages`, or other fields are not rewritten.
+## Built-in Keywords
+
+The built-in preset is enabled by default and covers major AI coding editors, assistants, terminal agents, and related general-purpose agents:
+
+- Claude Code, OpenAI Codex / Codex CLI, OpenCode
+- GitHub Copilot / Copilot CLI, Gemini Code Assist / Gemini CLI
+- Cursor, Windsurf / Codeium, Cline, Roo Code, Kilo Code, Aider, Continue.dev
+- Amazon Q Developer / CodeWhisperer, JetBrains AI Assistant / Junie, Kiro
+- Qoder / Qoder CLI, Qwen Code, Trae, Tabnine, Sourcegraph Cody, Augment Code
+- Replit Agent / Ghostwriter, Devin, OpenHands, SWE-agent, Goose
+- Zed AI, Void Editor, PearAI, Refact.ai, Tabby, GitLab Duo, Visual Studio IntelliCode
+- CodeBuddy, Blackbox AI, Pieces for Developers, Qodo / CodiumAI, Rovo Dev CLI, Factory Droid
+- OpenClaw (including Clawdbot and Moltbot), Hermes Agent, WorkBuddy
 
 ## Mapping Configuration
 
-You can disable the built-in preset and provide your own mapping relationships in the plugin config:
+You can select rewrite mode, disable the built-in preset, and provide your own mapping relationships in the plugin config:
 
 ```yaml
 plugins:
@@ -24,6 +35,7 @@ plugins:
     antigravity-coding-filter:
       enabled: true
       priority: 1
+      mode: rewrite
       use_default_keywords: false
       custom_mappings:
         Cursor: Antigravity
@@ -31,7 +43,7 @@ plugins:
         JetBrains AI: Antigravity
 ```
 
-`custom_mappings` also accepts a comma- or newline-delimited `from: to` string for simpler one-line config. Blank entries and duplicate source names are ignored.
+In `block` mode, each `custom_mappings` key is an additional blocked keyword and its value is ignored. In `rewrite` mode, the key is replaced with its value. The field also accepts a comma- or newline-delimited `from: to` string. Blank entries and duplicate source names are ignored.
 
 ## Build
 
@@ -56,6 +68,7 @@ plugins:
     antigravity-coding-filter:
       enabled: true
       priority: 1
+      mode: block
       use_default_keywords: true
       custom_mappings: {}
 ```

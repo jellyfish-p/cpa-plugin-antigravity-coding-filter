@@ -40,6 +40,8 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"unsafe"
@@ -53,7 +55,7 @@ const abiVersion = 1
 
 const (
 	pluginName       = "antigravity-coding-filter"
-	pluginVersion    = "0.1.0"
+	pluginVersion    = "0.2.0"
 	pluginRepository = "https://github.com/jellyfish-p/cpa-plugin-antigravity-coding-filter"
 )
 
@@ -122,6 +124,24 @@ func handlePluginCall(method string, request []byte) ([]byte, int) {
 		return handlePluginLifecycle(request), 0
 	case pluginabi.MethodPluginReconfigure:
 		return handlePluginLifecycle(request), 0
+	case pluginabi.MethodModelRoute:
+		return handleModelRoute(request), 0
+	case pluginabi.MethodExecutorExecute, pluginabi.MethodExecutorCountTokens:
+		return mustEnvelope(pluginapi.ExecutorResponse{
+			Payload: blockPayload(),
+			Headers: jsonHeaders(),
+		}), 0
+	case pluginabi.MethodExecutorHTTPRequest:
+		return mustEnvelope(pluginapi.ExecutorHTTPResponse{
+			StatusCode: http.StatusForbidden,
+			Body:       blockPayload(),
+			Headers:    jsonHeaders(),
+		}), 0
+	case pluginabi.MethodExecutorExecuteStream:
+		return mustEnvelope(executorStreamResponse{
+			Headers: jsonHeaders(),
+			Chunks:  []executorStreamChunk{{Payload: blockPayload()}},
+		}), 0
 	case pluginabi.MethodRequestInterceptBefore:
 		return handleRequestInterceptBefore(request), 0
 	case pluginabi.MethodRequestInterceptAfter:
@@ -147,9 +167,12 @@ func registrationResponse() any {
 		SchemaVersion uint32             `json:"schema_version"`
 		Metadata      pluginapi.Metadata `json:"metadata"`
 		Capabilities  struct {
-			ModelRouter        bool `json:"model_router"`
-			Executor           bool `json:"executor"`
-			RequestInterceptor bool `json:"request_interceptor"`
+			ModelRouter           bool                         `json:"model_router"`
+			Executor              bool                         `json:"executor"`
+			ExecutorModelScope    pluginapi.ExecutorModelScope `json:"executor_model_scope"`
+			ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
+			ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
+			RequestInterceptor    bool                         `json:"request_interceptor"`
 		} `json:"capabilities"`
 	}{
 		SchemaVersion: pluginabi.SchemaVersion,
@@ -162,11 +185,19 @@ func registrationResponse() any {
 			ConfigFields:     configFields(),
 		},
 		Capabilities: struct {
-			ModelRouter        bool `json:"model_router"`
-			Executor           bool `json:"executor"`
-			RequestInterceptor bool `json:"request_interceptor"`
+			ModelRouter           bool                         `json:"model_router"`
+			Executor              bool                         `json:"executor"`
+			ExecutorModelScope    pluginapi.ExecutorModelScope `json:"executor_model_scope"`
+			ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
+			ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
+			RequestInterceptor    bool                         `json:"request_interceptor"`
 		}{
-			RequestInterceptor: true,
+			ModelRouter:           true,
+			Executor:              true,
+			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
+			ExecutorInputFormats:  []string{"chat-completions", "responses", "anthropic", "gemini"},
+			ExecutorOutputFormats: []string{"chat-completions", "responses", "anthropic", "gemini"},
+			RequestInterceptor:    true,
 		},
 	}
 }
@@ -174,16 +205,72 @@ func registrationResponse() any {
 func configFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
 		{
+			Name:        "mode",
+			Type:        pluginapi.ConfigFieldTypeEnum,
+			EnumValues:  []string{string(filterModeBlock), string(filterModeRewrite)},
+			Description: "How matched requests are handled: block rejects the request (default); rewrite replaces matched names with Antigravity.",
+		},
+		{
 			Name:        "use_default_keywords",
 			Type:        pluginapi.ConfigFieldTypeBoolean,
-			Description: "Enable the built-in rewrite mapping preset: OpenCode, Codex, Claude Code -> Antigravity.",
+			Description: "Enable the built-in coding software and agent keyword preset.",
 		},
 		{
 			Name:        "custom_mappings",
 			Type:        pluginapi.ConfigFieldTypeObject,
-			Description: "Additional case-insensitive system-field rewrite mappings, for example Cursor: Antigravity.",
+			Description: "Additional case-insensitive system-field mappings. Keys are blocked in block mode and rewritten to their values in rewrite mode.",
 		},
 	}
+}
+
+type executorStreamResponse struct {
+	Headers http.Header           `json:"Headers,omitempty"`
+	Chunks  []executorStreamChunk `json:"Chunks,omitempty"`
+}
+
+type executorStreamChunk struct {
+	Payload []byte `json:"Payload"`
+}
+
+func handleModelRoute(request []byte) []byte {
+	var req pluginapi.ModelRouteRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return mustErrorEnvelope("invalid_request", fmt.Sprintf("decode model.route request: %v", err))
+	}
+
+	cfg := activeFilterConfig()
+	if cfg.Mode != filterModeBlock {
+		return mustEnvelope(pluginapi.ModelRouteResponse{Handled: false})
+	}
+	decision := classifyRequestWithConfig(req.Body, cfg)
+	if !decision.Blocked {
+		return mustEnvelope(pluginapi.ModelRouteResponse{Handled: false})
+	}
+
+	return mustEnvelope(pluginapi.ModelRouteResponse{
+		Handled:    true,
+		TargetKind: pluginapi.ModelRouteTargetSelf,
+		Reason:     fmt.Sprintf("%s:%s", decision.Signal, decision.Detail),
+	})
+}
+
+func blockPayload() []byte {
+	payload := map[string]any{
+		"error": map[string]any{
+			"code":    "blocked_by_antigravity_coding_filter",
+			"message": "request blocked because it matches a configured non-Antigravity coding software keyword",
+			"type":    "invalid_request_error",
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return []byte(`{"error":{"code":"blocked_by_antigravity_coding_filter"}}`)
+	}
+	return raw
+}
+
+func jsonHeaders() http.Header {
+	return http.Header{"content-type": []string{"application/json"}}
 }
 
 func handleRequestInterceptBefore(request []byte) []byte {
@@ -191,8 +278,12 @@ func handleRequestInterceptBefore(request []byte) []byte {
 	if err := json.Unmarshal(request, &req); err != nil {
 		return mustErrorEnvelope("invalid_request", fmt.Sprintf("decode request.intercept_before request: %v", err))
 	}
+	cfg := activeFilterConfig()
+	if cfg.Mode != filterModeRewrite {
+		return mustEnvelope(pluginapi.RequestInterceptResponse{})
+	}
 
-	body, rewritten := rewriteRequestBody(req.Body)
+	body, rewritten := rewriteRequestBodyWithConfig(req.Body, cfg)
 	if !rewritten {
 		return mustEnvelope(pluginapi.RequestInterceptResponse{})
 	}
@@ -224,10 +315,72 @@ func mustRawMessage(value any) json.RawMessage {
 }
 
 var defaultRewriteMappings = []rewriteMapping{
-	{Match: "opencode", Replacement: "Antigravity"},
-	{Match: "codex", Replacement: "Antigravity"},
-	{Match: "claude code", Replacement: "Antigravity"},
+	// Major AI code editors, assistants, and terminal coding agents.
+	{Match: "Claude Code", Replacement: "Antigravity"},
+	{Match: "OpenAI Codex", Replacement: "Antigravity"},
+	{Match: "Codex CLI", Replacement: "Antigravity"},
+	{Match: "Codex", Replacement: "Antigravity"},
+	{Match: "OpenCode", Replacement: "Antigravity"},
+	{Match: "GitHub Copilot CLI", Replacement: "Antigravity"},
+	{Match: "GitHub Copilot", Replacement: "Antigravity"},
+	{Match: "Gemini Code Assist", Replacement: "Antigravity"},
+	{Match: "Gemini CLI", Replacement: "Antigravity"},
+	{Match: "Cursor", Replacement: "Antigravity"},
+	{Match: "Windsurf", Replacement: "Antigravity"},
+	{Match: "Codeium", Replacement: "Antigravity"},
+	{Match: "Cline", Replacement: "Antigravity"},
+	{Match: "Roo Code", Replacement: "Antigravity"},
+	{Match: "Kilo Code", Replacement: "Antigravity"},
+	{Match: "Aider", Replacement: "Antigravity"},
+	{Match: "Continue.dev", Replacement: "Antigravity"},
+	{Match: "Amazon Q Developer", Replacement: "Antigravity"},
+	{Match: "Amazon CodeWhisperer", Replacement: "Antigravity"},
+	{Match: "JetBrains AI Assistant", Replacement: "Antigravity"},
+	{Match: "JetBrains Junie", Replacement: "Antigravity"},
+	{Match: "Kiro", Replacement: "Antigravity"},
+	{Match: "Qoder CLI", Replacement: "Antigravity"},
+	{Match: "Qoder", Replacement: "Antigravity"},
+	{Match: "Qwen Code", Replacement: "Antigravity"},
+	{Match: "Trae", Replacement: "Antigravity"},
+	{Match: "Tabnine", Replacement: "Antigravity"},
+	{Match: "Sourcegraph Cody", Replacement: "Antigravity"},
+	{Match: "Augment Code", Replacement: "Antigravity"},
+	{Match: "Replit Agent", Replacement: "Antigravity"},
+	{Match: "Replit Ghostwriter", Replacement: "Antigravity"},
+	{Match: "Devin", Replacement: "Antigravity"},
+	{Match: "OpenHands", Replacement: "Antigravity"},
+	{Match: "SWE-agent", Replacement: "Antigravity"},
+	{Match: "Goose", Replacement: "Antigravity"},
+	{Match: "Zed AI", Replacement: "Antigravity"},
+	{Match: "Void Editor", Replacement: "Antigravity"},
+	{Match: "PearAI", Replacement: "Antigravity"},
+	{Match: "Refact.ai", Replacement: "Antigravity"},
+	{Match: "Tabby", Replacement: "Antigravity"},
+	{Match: "GitLab Duo", Replacement: "Antigravity"},
+	{Match: "Visual Studio IntelliCode", Replacement: "Antigravity"},
+	{Match: "CodeBuddy", Replacement: "Antigravity"},
+	{Match: "Blackbox AI", Replacement: "Antigravity"},
+	{Match: "Pieces for Developers", Replacement: "Antigravity"},
+	{Match: "Qodo", Replacement: "Antigravity"},
+	{Match: "CodiumAI", Replacement: "Antigravity"},
+	{Match: "Rovo Dev CLI", Replacement: "Antigravity"},
+	{Match: "Factory Droid", Replacement: "Antigravity"},
+
+	// General-purpose local agents that can generate and modify code.
+	{Match: "OpenClaw", Replacement: "Antigravity"},
+	{Match: "Clawdbot", Replacement: "Antigravity"},
+	{Match: "Moltbot", Replacement: "Antigravity"},
+	{Match: "Hermes Agent", Replacement: "Antigravity"},
+	{Match: "Hermes", Replacement: "Antigravity"},
+	{Match: "WorkBuddy", Replacement: "Antigravity"},
 }
+
+type filterMode string
+
+const (
+	filterModeBlock   filterMode = "block"
+	filterModeRewrite filterMode = "rewrite"
+)
 
 type rewriteMapping struct {
 	Match       string
@@ -235,6 +388,7 @@ type rewriteMapping struct {
 }
 
 type filterConfig struct {
+	Mode               filterMode
 	UseDefaultKeywords bool
 	CustomMappings     []rewriteMapping
 }
@@ -245,7 +399,7 @@ var (
 )
 
 func defaultFilterConfig() filterConfig {
-	return filterConfig{UseDefaultKeywords: true}
+	return filterConfig{Mode: filterModeBlock, UseDefaultKeywords: true}
 }
 
 func applyFilterConfig(cfg filterConfig) {
@@ -253,6 +407,7 @@ func applyFilterConfig(cfg filterConfig) {
 	defer filterConfigMu.Unlock()
 
 	currentFilterConfig = filterConfig{
+		Mode:               cfg.Mode,
 		UseDefaultKeywords: cfg.UseDefaultKeywords,
 		CustomMappings:     append([]rewriteMapping(nil), normalizeMappings(cfg.CustomMappings)...),
 	}
@@ -263,6 +418,7 @@ func activeFilterConfig() filterConfig {
 	defer filterConfigMu.RUnlock()
 
 	return filterConfig{
+		Mode:               currentFilterConfig.Mode,
 		UseDefaultKeywords: currentFilterConfig.UseDefaultKeywords,
 		CustomMappings:     append([]rewriteMapping(nil), currentFilterConfig.CustomMappings...),
 	}
@@ -289,6 +445,16 @@ func parseFilterConfigYAML(raw []byte) (filterConfig, error) {
 	var values map[string]any
 	if err := yaml.Unmarshal(raw, &values); err != nil {
 		return filterConfig{}, fmt.Errorf("decode config yaml: %w", err)
+	}
+	if value, exists := values["mode"]; exists {
+		text, ok := value.(string)
+		if !ok {
+			return filterConfig{}, fmt.Errorf("mode must be a string")
+		}
+		cfg.Mode = filterMode(strings.ToLower(strings.TrimSpace(text)))
+		if cfg.Mode != filterModeBlock && cfg.Mode != filterModeRewrite {
+			return filterConfig{}, fmt.Errorf("mode must be one of: block, rewrite")
+		}
 	}
 	if value, exists := values["use_default_keywords"]; exists {
 		boolValue, ok := value.(bool)
@@ -389,15 +555,59 @@ func normalizeMappings(mappings []rewriteMapping) []rewriteMapping {
 	for i := len(reversed) - 1; i >= 0; i-- {
 		out = append(out, reversed[i])
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if len(out[i].Match) == len(out[j].Match) {
+			return out[i].Match < out[j].Match
+		}
+		return len(out[i].Match) > len(out[j].Match)
+	})
 	return out
 }
 
+type filterDecision struct {
+	Blocked bool
+	Signal  string
+	Detail  string
+}
+
+func classifyRequest(body []byte) filterDecision {
+	return classifyRequestWithConfig(body, activeFilterConfig())
+}
+
+func classifyRequestWithConfig(body []byte, cfg filterConfig) filterDecision {
+	var root any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return filterDecision{}
+	}
+
+	mappings := effectiveMappings(cfg)
+	var decision filterDecision
+	walkJSON(root, func(path []string, value any) bool {
+		if len(path) == 0 || path[len(path)-1] != "system" {
+			return true
+		}
+		text := strings.ToLower(collectText(value))
+		for _, mapping := range mappings {
+			if strings.Contains(text, mapping.Match) {
+				decision = filterDecision{Blocked: true, Signal: "system.keyword", Detail: mapping.Match}
+				return false
+			}
+		}
+		return true
+	})
+	return decision
+}
+
 func rewriteRequestBody(body []byte) ([]byte, bool) {
+	return rewriteRequestBodyWithConfig(body, activeFilterConfig())
+}
+
+func rewriteRequestBodyWithConfig(body []byte, cfg filterConfig) ([]byte, bool) {
 	var root any
 	if err := json.Unmarshal(body, &root); err != nil {
 		return nil, false
 	}
-	rewritten, changed := rewriteSystemFields(root, effectiveMappings(activeFilterConfig()))
+	rewritten, changed := rewriteSystemFields(root, effectiveMappings(cfg))
 	if !changed {
 		return nil, false
 	}

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestHandlePluginCallRegisterDeclaresRequestInterceptor(t *testing.T) {
+func TestHandlePluginCallRegisterDeclaresBothFilterModes(t *testing.T) {
 	raw, code := handlePluginCall("plugin.register", nil)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; body=%s", code, raw)
@@ -24,16 +24,19 @@ func TestHandlePluginCallRegisterDeclaresRequestInterceptor(t *testing.T) {
 		t.Fatalf("GitHubRepository = %#v, want %q", metadata["GitHubRepository"], pluginRepository)
 	}
 	capabilities := result["capabilities"].(map[string]any)
-	if capabilities["model_router"] == true {
-		t.Fatalf("model_router = %#v, want false", capabilities["model_router"])
+	if capabilities["model_router"] != true {
+		t.Fatalf("model_router = %#v, want true", capabilities["model_router"])
 	}
-	if capabilities["executor"] == true {
-		t.Fatalf("executor = %#v, want false", capabilities["executor"])
+	if capabilities["executor"] != true {
+		t.Fatalf("executor = %#v, want true", capabilities["executor"])
 	}
 	if capabilities["request_interceptor"] != true {
 		t.Fatalf("request_interceptor = %#v, want true", capabilities["request_interceptor"])
 	}
 	fields := result["metadata"].(map[string]any)["ConfigFields"].([]any)
+	if !hasEnumConfigField(fields, "mode", []string{"block", "rewrite"}) {
+		t.Fatalf("ConfigFields = %#v, want enum mode with block and rewrite", fields)
+	}
 	if !hasConfigField(fields, "use_default_keywords", "boolean") {
 		t.Fatalf("ConfigFields = %#v, want boolean use_default_keywords", fields)
 	}
@@ -49,6 +52,7 @@ func TestHandlePluginCallReconfigureAppliesCustomMappingsAndDefaultToggle(t *tes
 enabled: true
 priority: 1
 use_default_keywords: false
+mode: rewrite
 custom_mappings:
   Cursor: Antigravity
   Windsurf: Antigravity
@@ -139,6 +143,9 @@ custom_mappings:
 }
 
 func TestHandlePluginCallRequestInterceptBeforeRewritesCodingSignals(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	applyFilterConfig(filterConfig{Mode: filterModeRewrite, UseDefaultKeywords: true})
+
 	request := requestInterceptRequestJSON(t, `{"system":"You are Codex.","messages":[]}`)
 
 	raw, code := handlePluginCall("request.intercept_before", request)
@@ -162,6 +169,128 @@ func TestHandlePluginCallRequestInterceptBeforeRewritesCodingSignals(t *testing.
 	}
 	if !strings.Contains(string(body), "You are Antigravity.") {
 		t.Fatalf("body = %s, want rewritten system", body)
+	}
+}
+
+func TestHandlePluginCallRequestInterceptBeforeDoesNotRewriteInDefaultBlockMode(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	applyFilterConfig(defaultFilterConfig())
+
+	request := requestInterceptRequestJSON(t, `{"system":"You are Codex.","messages":[]}`)
+	raw, code := handlePluginCall("request.intercept_before", request)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; body=%s", code, raw)
+	}
+
+	var envelope struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Body string `json:"Body"`
+		} `json:"result"`
+	}
+	mustUnmarshalJSON(t, raw, &envelope)
+	if !envelope.OK || envelope.Result.Body != "" {
+		t.Fatalf("response = %s, want unchanged request in block mode", raw)
+	}
+}
+
+func TestHandlePluginCallModelRouteBlocksMatchedRequestsByDefault(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	applyFilterConfig(defaultFilterConfig())
+
+	request := modelRouteRequestJSON(t, `{"system":"You are Qoder.","messages":[]}`)
+	raw, code := handlePluginCall("model.route", request)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; body=%s", code, raw)
+	}
+
+	var envelope struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Handled    bool   `json:"Handled"`
+			TargetKind string `json:"TargetKind"`
+			Reason     string `json:"Reason"`
+		} `json:"result"`
+	}
+	mustUnmarshalJSON(t, raw, &envelope)
+	if !envelope.OK || !envelope.Result.Handled {
+		t.Fatalf("response = %s, want handled block route", raw)
+	}
+	if envelope.Result.TargetKind != "self" {
+		t.Fatalf("TargetKind = %q, want self", envelope.Result.TargetKind)
+	}
+	if !strings.Contains(envelope.Result.Reason, "system.keyword:qoder") {
+		t.Fatalf("Reason = %q, want qoder keyword detail", envelope.Result.Reason)
+	}
+}
+
+func TestHandlePluginCallModelRoutePassesInRewriteMode(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	applyFilterConfig(filterConfig{Mode: filterModeRewrite, UseDefaultKeywords: true})
+
+	raw, code := handlePluginCall("model.route", modelRouteRequestJSON(t, `{"system":"You are Codex."}`))
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; body=%s", code, raw)
+	}
+
+	var envelope struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Handled bool `json:"Handled"`
+		} `json:"result"`
+	}
+	mustUnmarshalJSON(t, raw, &envelope)
+	if !envelope.OK || envelope.Result.Handled {
+		t.Fatalf("response = %s, want unhandled route in rewrite mode", raw)
+	}
+}
+
+func TestHandlePluginCallExecutorReturnsBlockPayload(t *testing.T) {
+	raw, code := handlePluginCall("executor.execute", []byte(`{"Model":"antigravity/test"}`))
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; body=%s", code, raw)
+	}
+
+	var envelope struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Payload string              `json:"Payload"`
+			Headers map[string][]string `json:"Headers"`
+		} `json:"result"`
+	}
+	mustUnmarshalJSON(t, raw, &envelope)
+	payload, err := base64.StdEncoding.DecodeString(envelope.Result.Payload)
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if !envelope.OK || !strings.Contains(string(payload), "blocked_by_antigravity_coding_filter") {
+		t.Fatalf("response = %s, want block payload", raw)
+	}
+	if got := envelope.Result.Headers["content-type"]; len(got) != 1 || got[0] != "application/json" {
+		t.Fatalf("content-type = %#v, want application/json", got)
+	}
+}
+
+func TestHandlePluginCallReconfigureRejectsInvalidModeAndKeepsPreviousConfig(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	applyFilterConfig(filterConfig{Mode: filterModeRewrite, UseDefaultKeywords: true})
+
+	raw, code := handlePluginCall("plugin.reconfigure", lifecycleRequestJSON(t, []byte("mode: delete\n")))
+	if code != 0 {
+		t.Fatalf("code = %d, want handled error envelope; body=%s", code, raw)
+	}
+	var envelope struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	mustUnmarshalJSON(t, raw, &envelope)
+	if envelope.OK || envelope.Error.Code != "invalid_config" {
+		t.Fatalf("response = %s, want invalid_config", raw)
+	}
+	if got := activeFilterConfig().Mode; got != filterModeRewrite {
+		t.Fatalf("mode = %q, want previous rewrite mode retained", got)
 	}
 }
 
@@ -224,6 +353,19 @@ func requestInterceptRequestJSON(t *testing.T, body string) []byte {
 	return raw
 }
 
+func modelRouteRequestJSON(t *testing.T, body string) []byte {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"SourceFormat":   "openai",
+		"RequestedModel": "antigravity/test",
+		"Body":           []byte(body),
+	})
+	if err != nil {
+		t.Fatalf("marshal model route request: %v", err)
+	}
+	return raw
+}
+
 func lifecycleRequestJSON(t *testing.T, configYAML []byte) []byte {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{
@@ -245,6 +387,26 @@ func hasConfigField(fields []any, name, fieldType string) bool {
 		if object["Name"] == name && object["Type"] == fieldType {
 			return true
 		}
+	}
+	return false
+}
+
+func hasEnumConfigField(fields []any, name string, wantValues []string) bool {
+	for _, field := range fields {
+		object, ok := field.(map[string]any)
+		if !ok || object["Name"] != name || object["Type"] != "enum" {
+			continue
+		}
+		values, ok := object["EnumValues"].([]any)
+		if !ok || len(values) != len(wantValues) {
+			return false
+		}
+		for i, want := range wantValues {
+			if values[i] != want {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }

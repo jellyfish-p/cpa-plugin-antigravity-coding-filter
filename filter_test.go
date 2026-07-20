@@ -42,6 +42,53 @@ func TestRewriteRequestReplacesDefaultSystemKeywords(t *testing.T) {
 	}
 }
 
+func TestBuiltInKeywordPresetCoversMainstreamCodingToolsAndAgents(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	applyFilterConfig(defaultFilterConfig())
+
+	for _, mapping := range defaultRewriteMappings {
+		keyword := mapping.Match
+		t.Run(keyword, func(t *testing.T) {
+			decision := classifyRequest([]byte(`{"system":"You are ` + keyword + `."}`))
+			if !decision.Blocked {
+				t.Fatalf("%q was not detected by built-in preset", keyword)
+			}
+			got, rewritten := rewriteRequestBody([]byte(`{"system":"You are ` + keyword + `."}`))
+			if !rewritten || !strings.Contains(string(got), "You are Antigravity.") {
+				t.Fatalf("%q rewrite = %s, changed=%v", keyword, got, rewritten)
+			}
+		})
+	}
+}
+
+func TestDefaultFilterModeBlocksAndRewriteMustBeSelected(t *testing.T) {
+	cfg, err := parseFilterConfigYAML(nil)
+	if err != nil {
+		t.Fatalf("parse default config: %v", err)
+	}
+	if cfg.Mode != filterModeBlock {
+		t.Fatalf("default mode = %q, want block", cfg.Mode)
+	}
+
+	cfg, err = parseFilterConfigYAML([]byte("mode: rewrite\n"))
+	if err != nil {
+		t.Fatalf("parse rewrite config: %v", err)
+	}
+	if cfg.Mode != filterModeRewrite {
+		t.Fatalf("configured mode = %q, want rewrite", cfg.Mode)
+	}
+}
+
+func TestLongerBuiltInNamesAreRewrittenBeforeShortAliases(t *testing.T) {
+	got, rewritten := rewriteRequestBody([]byte(`{"system":"Run GitHub Copilot CLI and OpenAI Codex."}`))
+	if !rewritten {
+		t.Fatal("rewritten = false, want true")
+	}
+	if string(got) != `{"system":"Run Antigravity and Antigravity."}` {
+		t.Fatalf("body = %s, want complete product names replaced once", got)
+	}
+}
+
 func TestRewriteRequestIgnoresKeywordsOutsideSystem(t *testing.T) {
 	body := []byte(`{
 		"messages":[{"role":"user","content":"please compare OpenCode and Codex"}],
