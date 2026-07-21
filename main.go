@@ -55,7 +55,7 @@ const abiVersion = 1
 
 const (
 	pluginName       = "antigravity-coding-filter"
-	pluginVersion    = "0.2.0"
+	pluginVersion    = "0.2.1"
 	pluginRepository = "https://github.com/jellyfish-p/cpa-plugin-antigravity-coding-filter"
 )
 
@@ -126,21 +126,13 @@ func handlePluginCall(method string, request []byte) ([]byte, int) {
 		return handlePluginLifecycle(request), 0
 	case pluginabi.MethodModelRoute:
 		return handleModelRoute(request), 0
-	case pluginabi.MethodExecutorExecute, pluginabi.MethodExecutorCountTokens:
-		return mustEnvelope(pluginapi.ExecutorResponse{
-			Payload: blockPayload(),
-			Headers: jsonHeaders(),
-		}), 0
+	case pluginabi.MethodExecutorExecute, pluginabi.MethodExecutorCountTokens, pluginabi.MethodExecutorExecuteStream:
+		return blockErrorEnvelope(), 0
 	case pluginabi.MethodExecutorHTTPRequest:
 		return mustEnvelope(pluginapi.ExecutorHTTPResponse{
 			StatusCode: http.StatusForbidden,
 			Body:       blockPayload(),
 			Headers:    jsonHeaders(),
-		}), 0
-	case pluginabi.MethodExecutorExecuteStream:
-		return mustEnvelope(executorStreamResponse{
-			Headers: jsonHeaders(),
-			Chunks:  []executorStreamChunk{{Payload: blockPayload()}},
 		}), 0
 	case pluginabi.MethodRequestInterceptBefore:
 		return handleRequestInterceptBefore(request), 0
@@ -223,15 +215,6 @@ func configFields() []pluginapi.ConfigField {
 	}
 }
 
-type executorStreamResponse struct {
-	Headers http.Header           `json:"Headers,omitempty"`
-	Chunks  []executorStreamChunk `json:"Chunks,omitempty"`
-}
-
-type executorStreamChunk struct {
-	Payload []byte `json:"Payload"`
-}
-
 func handleModelRoute(request []byte) []byte {
 	var req pluginapi.ModelRouteRequest
 	if err := json.Unmarshal(request, &req); err != nil {
@@ -254,11 +237,20 @@ func handleModelRoute(request []byte) []byte {
 	})
 }
 
+const (
+	blockErrorCode    = "blocked_by_antigravity_coding_filter"
+	blockErrorMessage = "request blocked because it matches a configured non-Antigravity coding software keyword"
+)
+
+func blockErrorEnvelope() []byte {
+	return mustHTTPErrorEnvelope(blockErrorCode, blockErrorMessage, http.StatusForbidden)
+}
+
 func blockPayload() []byte {
 	payload := map[string]any{
 		"error": map[string]any{
-			"code":    "blocked_by_antigravity_coding_filter",
-			"message": "request blocked because it matches a configured non-Antigravity coding software keyword",
+			"code":    blockErrorCode,
+			"message": blockErrorMessage,
 			"type":    "invalid_request_error",
 		},
 	}
@@ -299,7 +291,15 @@ func mustEnvelope(result any) []byte {
 }
 
 func mustErrorEnvelope(code, message string) []byte {
-	raw, err := json.Marshal(pluginabi.Envelope{OK: false, Error: &pluginabi.Error{Code: code, Message: message}})
+	return mustHTTPErrorEnvelope(code, message, 0)
+}
+
+func mustHTTPErrorEnvelope(code, message string, status int) []byte {
+	raw, err := json.Marshal(pluginabi.Envelope{OK: false, Error: &pluginabi.Error{
+		Code:       code,
+		Message:    message,
+		HTTPStatus: status,
+	}})
 	if err != nil {
 		return []byte(`{"ok":false,"error":{"code":"marshal_error","message":"failed to encode plugin response"}}`)
 	}

@@ -1,5 +1,5 @@
-github.com/router-for-me/CLIProxyAPI/v7 v7.2.16 h1:0GZ1r+y+JDnOL45MGe3vHIzi2y2OKMs4k1JcaHtLuoU=
-github.com/router-for-me/CLIProxyAPI/v7 v7.2.16/go.mod h1:5LQLwZuB03QHP2jsRo4Kl7pJBgsu9w0O/v1F6Ze+d4U=
+github.com/router-for-me/CLIProxyAPI/v7 v7.2.93 h1:qkPSuVXLV8+fcOoRJJxJOt/bt/k+OtsFWSjV6Tfcv8M=
+github.com/router-for-me/CLIProxyAPI/v7 v7.2.93/go.mod h1:ytvZNWbCv7PrAyR80+RKsDJPODsdL6qxyFaXDBNZdqs=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=

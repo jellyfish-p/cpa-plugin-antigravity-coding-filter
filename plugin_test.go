@@ -245,8 +245,39 @@ func TestHandlePluginCallModelRoutePassesInRewriteMode(t *testing.T) {
 	}
 }
 
-func TestHandlePluginCallExecutorReturnsBlockPayload(t *testing.T) {
-	raw, code := handlePluginCall("executor.execute", []byte(`{"Model":"antigravity/test"}`))
+func TestHandlePluginCallExecutorMethodsReturnForbiddenError(t *testing.T) {
+	methods := []string{"executor.execute", "executor.execute_stream", "executor.count_tokens"}
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			raw, code := handlePluginCall(method, []byte(`{"Model":"antigravity/test"}`))
+			if code != 0 {
+				t.Fatalf("code = %d, want 0; body=%s", code, raw)
+			}
+
+			var envelope struct {
+				OK    bool `json:"ok"`
+				Error struct {
+					Code       string `json:"code"`
+					Message    string `json:"message"`
+					HTTPStatus int    `json:"http_status"`
+				} `json:"error"`
+			}
+			mustUnmarshalJSON(t, raw, &envelope)
+			if envelope.OK {
+				t.Fatalf("response = %s, want error envelope", raw)
+			}
+			if envelope.Error.Code != blockErrorCode || envelope.Error.Message != blockErrorMessage {
+				t.Fatalf("error = %#v, want configured block error", envelope.Error)
+			}
+			if envelope.Error.HTTPStatus != 403 {
+				t.Fatalf("http_status = %d, want 403", envelope.Error.HTTPStatus)
+			}
+		})
+	}
+}
+
+func TestHandlePluginCallExecutorHTTPRequestReturnsForbiddenResponse(t *testing.T) {
+	raw, code := handlePluginCall("executor.http_request", []byte(`{}`))
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; body=%s", code, raw)
 	}
@@ -254,17 +285,21 @@ func TestHandlePluginCallExecutorReturnsBlockPayload(t *testing.T) {
 	var envelope struct {
 		OK     bool `json:"ok"`
 		Result struct {
-			Payload string              `json:"Payload"`
-			Headers map[string][]string `json:"Headers"`
+			StatusCode int                 `json:"StatusCode"`
+			Body       string              `json:"Body"`
+			Headers    map[string][]string `json:"Headers"`
 		} `json:"result"`
 	}
 	mustUnmarshalJSON(t, raw, &envelope)
-	payload, err := base64.StdEncoding.DecodeString(envelope.Result.Payload)
+	body, err := base64.StdEncoding.DecodeString(envelope.Result.Body)
 	if err != nil {
-		t.Fatalf("decode payload: %v", err)
+		t.Fatalf("decode body: %v", err)
 	}
-	if !envelope.OK || !strings.Contains(string(payload), "blocked_by_antigravity_coding_filter") {
-		t.Fatalf("response = %s, want block payload", raw)
+	if !envelope.OK || envelope.Result.StatusCode != 403 {
+		t.Fatalf("response = %s, want HTTP 403", raw)
+	}
+	if !strings.Contains(string(body), blockErrorCode) {
+		t.Fatalf("body = %s, want block error code", body)
 	}
 	if got := envelope.Result.Headers["content-type"]; len(got) != 1 || got[0] != "application/json" {
 		t.Fatalf("content-type = %#v, want application/json", got)
