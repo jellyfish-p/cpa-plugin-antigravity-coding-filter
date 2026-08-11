@@ -55,7 +55,7 @@ const abiVersion = 1
 
 const (
 	pluginName       = "antigravity-coding-filter"
-	pluginVersion    = "0.2.1"
+	pluginVersion    = "0.3.0"
 	pluginRepository = "https://github.com/jellyfish-p/cpa-plugin-antigravity-coding-filter"
 )
 
@@ -212,6 +212,16 @@ func configFields() []pluginapi.ConfigField {
 			Type:        pluginapi.ConfigFieldTypeObject,
 			Description: "Additional case-insensitive system-field mappings. Keys are blocked in block mode and rewritten to their values in rewrite mode.",
 		},
+		{
+			Name:        "rewrite_headers",
+			Type:        pluginapi.ConfigFieldTypeBoolean,
+			Description: "In rewrite mode, also rewrite whitelisted client-identity request headers (User-Agent, originator, x-opencode-client, x-msh-platform, anthropic-client-platform, x-goog-api-client). Enabled by default.",
+		},
+		{
+			Name:        "header_mappings",
+			Type:        pluginapi.ConfigFieldTypeObject,
+			Description: "Additional case-insensitive mappings applied only to whitelisted request headers. Use this for UA/originator spellings (e.g. kimi-code-cli, codex_cli_rs, pi) that must never be rewritten inside request bodies.",
+		},
 	}
 }
 
@@ -275,11 +285,19 @@ func handleRequestInterceptBefore(request []byte) []byte {
 		return mustEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 
-	body, rewritten := rewriteRequestBodyWithConfig(req.Body, cfg)
-	if !rewritten {
+	var response pluginapi.RequestInterceptResponse
+	if body, rewritten := rewriteRequestBodyWithConfig(req.Body, cfg); rewritten {
+		response.Body = body
+	}
+	if cfg.RewriteHeaders {
+		if headers, rewritten := rewriteIdentityHeaders(req.Headers, effectiveHeaderMappings(cfg)); rewritten {
+			response.Headers = headers
+		}
+	}
+	if response.Body == nil && response.Headers == nil {
 		return mustEnvelope(pluginapi.RequestInterceptResponse{})
 	}
-	return mustEnvelope(pluginapi.RequestInterceptResponse{Body: body})
+	return mustEnvelope(response)
 }
 
 func mustEnvelope(result any) []byte {
@@ -391,6 +409,8 @@ type filterConfig struct {
 	Mode               filterMode
 	UseDefaultKeywords bool
 	CustomMappings     []rewriteMapping
+	RewriteHeaders     bool
+	HeaderMappings     []rewriteMapping
 }
 
 var (
@@ -399,7 +419,7 @@ var (
 )
 
 func defaultFilterConfig() filterConfig {
-	return filterConfig{Mode: filterModeBlock, UseDefaultKeywords: true}
+	return filterConfig{Mode: filterModeBlock, UseDefaultKeywords: true, RewriteHeaders: true}
 }
 
 func applyFilterConfig(cfg filterConfig) {
@@ -410,6 +430,8 @@ func applyFilterConfig(cfg filterConfig) {
 		Mode:               cfg.Mode,
 		UseDefaultKeywords: cfg.UseDefaultKeywords,
 		CustomMappings:     append([]rewriteMapping(nil), normalizeMappings(cfg.CustomMappings)...),
+		RewriteHeaders:     cfg.RewriteHeaders,
+		HeaderMappings:     append([]rewriteMapping(nil), normalizeMappings(cfg.HeaderMappings)...),
 	}
 }
 
@@ -421,6 +443,8 @@ func activeFilterConfig() filterConfig {
 		Mode:               currentFilterConfig.Mode,
 		UseDefaultKeywords: currentFilterConfig.UseDefaultKeywords,
 		CustomMappings:     append([]rewriteMapping(nil), currentFilterConfig.CustomMappings...),
+		RewriteHeaders:     currentFilterConfig.RewriteHeaders,
+		HeaderMappings:     append([]rewriteMapping(nil), currentFilterConfig.HeaderMappings...),
 	}
 }
 
@@ -464,27 +488,41 @@ func parseFilterConfigYAML(raw []byte) (filterConfig, error) {
 		cfg.UseDefaultKeywords = boolValue
 	}
 	if value, exists := values["custom_mappings"]; exists {
-		mappings, err := parseCustomMappings(value)
+		mappings, err := parseCustomMappings("custom_mappings", value)
 		if err != nil {
 			return filterConfig{}, err
 		}
 		cfg.CustomMappings = mappings
 	}
+	if value, exists := values["rewrite_headers"]; exists {
+		boolValue, ok := value.(bool)
+		if !ok {
+			return filterConfig{}, fmt.Errorf("rewrite_headers must be a boolean")
+		}
+		cfg.RewriteHeaders = boolValue
+	}
+	if value, exists := values["header_mappings"]; exists {
+		mappings, err := parseCustomMappings("header_mappings", value)
+		if err != nil {
+			return filterConfig{}, err
+		}
+		cfg.HeaderMappings = mappings
+	}
 	return cfg, nil
 }
 
-func parseCustomMappings(value any) ([]rewriteMapping, error) {
+func parseCustomMappings(field string, value any) ([]rewriteMapping, error) {
 	switch typed := value.(type) {
 	case nil:
 		return nil, nil
 	case string:
-		return parseMappingString(typed)
+		return parseMappingString(field, typed)
 	case map[string]any:
 		mappings := make([]rewriteMapping, 0, len(typed))
 		for match, replacement := range typed {
 			text, ok := replacement.(string)
 			if !ok {
-				return nil, fmt.Errorf("custom_mappings values must be strings")
+				return nil, fmt.Errorf("%s values must be strings", field)
 			}
 			mappings = append(mappings, rewriteMapping{Match: match, Replacement: text})
 		}
@@ -494,9 +532,9 @@ func parseCustomMappings(value any) ([]rewriteMapping, error) {
 		for _, item := range typed {
 			text, ok := item.(string)
 			if !ok {
-				return nil, fmt.Errorf("custom_mappings entries must be strings")
+				return nil, fmt.Errorf("%s entries must be strings", field)
 			}
-			parsed, err := parseMappingString(text)
+			parsed, err := parseMappingString(field, text)
 			if err != nil {
 				return nil, err
 			}
@@ -504,11 +542,11 @@ func parseCustomMappings(value any) ([]rewriteMapping, error) {
 		}
 		return mappings, nil
 	default:
-		return nil, fmt.Errorf("custom_mappings must be an object, array, or string")
+		return nil, fmt.Errorf("%s must be an object, array, or string", field)
 	}
 }
 
-func parseMappingString(value string) ([]rewriteMapping, error) {
+func parseMappingString(field string, value string) ([]rewriteMapping, error) {
 	entries := strings.FieldsFunc(value, func(r rune) bool {
 		return r == ',' || r == '\n' || r == '\r'
 	})
@@ -520,7 +558,7 @@ func parseMappingString(value string) ([]rewriteMapping, error) {
 		}
 		match, replacement, ok := strings.Cut(entry, ":")
 		if !ok {
-			return nil, fmt.Errorf("custom_mappings entries must use match: replacement")
+			return nil, fmt.Errorf("%s entries must use match: replacement", field)
 		}
 		mappings = append(mappings, rewriteMapping{Match: match, Replacement: replacement})
 	}
@@ -607,7 +645,7 @@ func rewriteRequestBodyWithConfig(body []byte, cfg filterConfig) ([]byte, bool) 
 	if err := json.Unmarshal(body, &root); err != nil {
 		return nil, false
 	}
-	rewritten, changed := rewriteSystemFields(root, effectiveMappings(cfg))
+	rewritten, changed := rewriteIdentityFields(root, effectiveMappings(cfg))
 	if !changed {
 		return nil, false
 	}
