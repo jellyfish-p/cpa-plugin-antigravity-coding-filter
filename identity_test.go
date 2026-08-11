@@ -278,3 +278,56 @@ func interceptRequestWithHeaders(t *testing.T, body string, headers map[string][
 	}
 	return raw
 }
+
+// --- tool-calling traffic must pass through byte-identical ---
+
+func TestRewriteLeavesToolCallTrafficUntouched(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	applyFilterConfig(filterConfig{Mode: filterModeRewrite, UseDefaultKeywords: true})
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			// OpenAI chat: assistant tool_calls (arguments is a JSON string) + tool result.
+			name: "openai chat tool_calls",
+			body: `{"messages":[` +
+				`{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo Codex\"}"}}]},` +
+				`{"role":"tool","tool_call_id":"call_1","content":"Codex\n"}` +
+				`],"tools":[{"type":"function","function":{"name":"bash","description":"Run commands like codex would","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}}]}`,
+		},
+		{
+			// Anthropic: tool_use input object + tool_result, tool schema with keywords in description.
+			name: "anthropic tool_use",
+			body: `{"messages":[` +
+				`{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"echo Codex"}}]},` +
+				`{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"Codex"}]}` +
+				`],"tools":[{"name":"Bash","description":"Codex shell","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}]}`,
+		},
+		{
+			// Gemini: functionCall/functionResponse inside contents + functionDeclarations.
+			name: "gemini function calls",
+			body: `{"contents":[` +
+				`{"role":"model","parts":[{"functionCall":{"name":"bash","args":{"command":"echo Codex"}}}]},` +
+				`{"role":"user","parts":[{"functionResponse":{"name":"bash","response":{"output":"Codex"}}}]}` +
+				`],"tools":[{"functionDeclarations":[{"name":"bash","description":"Codex shell"}]}]}`,
+		},
+		{
+			// Responses: function_call/function_call_output items carry no role.
+			name: "responses function calls",
+			body: `{"input":[` +
+				`{"type":"function_call","name":"shell_tool","arguments":"{\"command\":\"echo Codex\"}","call_id":"c1"},` +
+				`{"type":"function_call_output","call_id":"c1","output":"Codex"}` +
+				`]}`,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, rewritten := rewriteRequestBody([]byte(tt.body)); rewritten {
+				t.Fatalf("rewritten = true, want tool traffic untouched; body=%s", got)
+			}
+		})
+	}
+}
