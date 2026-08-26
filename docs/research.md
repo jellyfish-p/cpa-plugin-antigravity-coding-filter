@@ -55,7 +55,7 @@ CPA 插件 ABI 已确认：
 
 - `agy 1.1.11`
 - `pi 0.82.1`
-- `kimi 0.34.0`
+- `kimi 0.35.0`
 - `codex-cli 0.147.0`
 - `gemini 0.53.1`
 - `claude 2.1.226`
@@ -159,9 +159,9 @@ system prompt 注入方式：
 - 可改写：`originator`、`User-Agent`、`x-opencode-client`、OpenRouter/NVIDIA 归因头
 - 不应全局替换：`pi` 单词、系统提示内容、文件路径、包名、工具名映射、Anthropic OAuth 认证逻辑
 
-## Kimi Code 0.34.0
+## Kimi Code 0.35.0
 
-注意：本机源码参考主要是 `/home/ubuntu/temp/kimi-code-0.33.0`，当前安装是 `0.34.0`，核心结构应一致，但 0.34.0 的增量未逐一验证。
+注意：本机源码参考主要是 `/home/ubuntu/temp/kimi-code-0.33.0`，当前安装是 `0.35.0`，核心结构应一致，但 0.34.0–0.35.0 的增量未逐一验证。
 
 system prompt 注入方式：
 
@@ -426,3 +426,125 @@ custom_mappings:
 - 改写 header 不需要修改 CPA，只需要修改插件。
 - 若要防封，合理方案是升级插件为“客户端身份重写器”。
 - 但即使完整改写 body/header，也不能保证绝对防封：上游还可能检查 TLS/JA3、session 状态、payload 元数据、请求 ID 格式、配额路径等。
+
+## 附录：2026-08-12 antigravity/gemini-cli 全链路 403 事故复盘
+
+### 症状
+
+- CPA 所有 antigravity 模型报 `400 antigravity auth missing project_id: no project_id in response`（onboarding 取不到 project_id）。
+- 随后 gemini-cli 与 antigravity 两条凭证均报 `403 CONSUMER_INVALID: Permission denied on resource project gen-lang-client-<redacted>`（service: cloudaicompanion.googleapis.com）。
+- 同一 Google 账号在 Cloud Shell 里的 gemini 正常（Cloud Shell 走 Google 托管的 cloud-shell 项目，不依赖用户项目）。
+
+### 根因
+
+`gcloud projects describe gen-lang-client-<redacted>` 显示 `lifecycleState: DELETE_REQUESTED`——项目正在被 Google 删除（此前因合规被停用，恢复邮件不等于撤销删除流程）。项目一删，绑定它的两条 OAuth 凭证全部 403。
+
+### 修复
+
+1. 新建项目 `<replacement-gcp-project>`，启用 `cloudaicompanion.googleapis.com`。
+2. 将 CPA 两条凭证文件（`antigravity-*.json`、`*-gemini-cli.json`）的 `project_id`（及 `project_ids`）改为 `<replacement-gcp-project>`。OAuth token 是账号级、与项目无关，无需重新授权。
+3. 两条链路恢复 200；pi 实测通过。
+
+### 经验
+
+- CPA antigravity executor 的 project_id 可直接写进凭证文件跳过 onboarding；字段在 token 刷新重写后仍保留。
+- 修改 bind-mount 凭证文件必须原子写（同目录 tmp + mv），否则 watcher 读到截断空文件会产生幽灵客户端；幽灵客户端刷新 token 时会把临时文件名写回磁盘，需删文件才能清除。
+- `gen-lang-client-*` 是 AI Studio 自动创建的项目，合规停用/删除会同时打死 gemini-cli 与 antigravity 两条链路。
+- 旧项目 `gen-lang-client-<redacted>` 已用 `gcloud projects undelete` 恢复为 ACTIVE，但其 serviceusage 资源未完全恢复（启用服务报 RESOURCES_NOT_FOUND），故弃用，改用新项目。
+
+## 2026-08-12 CPA / GPT-5.5 模型元数据审计
+
+### 审计口径与 alias 边界
+
+- 本节只核对模型元数据，不评价模型能力，也不推断 CPA/Kimi 渠道的实际路由。
+- 表内数值只适用于“配置名与厂商官方模型 ID 完全一致”的情况。Anthropic 从 4.6 起采用无日期但仍固定的 model ID；Google 的 stable/preview ID 和 OpenAI 的标准 `gpt-5.5` 也必须逐字匹配其官方页面。
+- “Context / input limit”保留厂商原始口径：Anthropic/OpenAI 发布 context window，Google 发布 input token limit；两者不做加减换算。
+- 任何带渠道前后缀或额外限额标记的名称，例如含 `100k`、`codex/`、`cx/` 的名称，均是渠道自定义 alias，不是这里核对的官方 ID。除非该渠道另有一手文档或接口返回证明，否则其 context/input limit、max output、image input、tool use、thinking/reasoning 选项及能否关闭全部记为**未确认**，不得套用对应基础模型规格。
+- 上述 alias 仅用于说明判定规则，不表示本仓库当前一定存在这些名称。
+
+### 官方基础模型规格
+
+| 配置名 | 官方身份与状态 | Context / input limit | Max output | Image input | Tool use | Thinking / reasoning 控制 | 可完全关闭 |
+| --- | --- | ---: | ---: | --- | --- | --- | --- |
+| `claude-sonnet-4-6` | Anthropic 官方固定 snapshot；无日期后缀也不是滚动 alias | 1M tokens | 128k tokens（同步 Messages API；见下方文档冲突说明） | 支持 | 支持 | `effort`: `low` / `medium` / `high`（默认）/ `max`；不支持 `xhigh`。推荐配合 `thinking: {type: "adaptive"}`；手动 `enabled + budget_tokens` 仍可用但已 deprecated | 是；不传 `thinking` 即不启用 thinking，也可显式 `disabled`。`effort` 本身不是开关 |
+| `gemini-2.5-pro` | Google 官方 stable model | 1,048,576 input tokens | 65,536 tokens | 支持 | 支持（Function calling） | GenerateContent: `thinkingBudget` 为 `128..32768`，`-1` 为动态且默认；Interactions: `thinking_level` 为 `low` / `medium` / `high`，默认 On | 否 |
+| `gemini-2.5-flash` | Google 官方 stable model | 1,048,576 input tokens | 65,536 tokens | 支持 | 支持（Function calling） | GenerateContent: `thinkingBudget` 为 `0..24576`，`-1` 为动态且默认；Interactions: `thinking_level` 为 `low` / `medium` / `high`，默认 On | 是；GenerateContent 设 `thinkingBudget: 0` |
+| `gemini-2.5-flash-lite` | Google 官方 stable model | 1,048,576 input tokens | 65,536 tokens | 支持 | 支持（Function calling） | GenerateContent: 默认不思考，启用预算 `512..24576`，`0` 关闭、`-1` 动态；Interactions: `thinking_level` 为 `low` / `medium` / `high`，默认 Off | 是；默认 Off，或 GenerateContent 设 `thinkingBudget: 0` |
+| `gemini-3.1-flash-lite` | Google 官方 stable/GA model | 1,048,576 input tokens | 65,536 tokens | 支持 | 支持（Function calling） | `thinking_level`: `minimal`（默认）/ `low` / `medium` / `high` | 否；`minimal` 对多数请求近似 no thinking，但官方明确不保证完全关闭 |
+| `gemini-3.1-flash-lite-preview` | 曾是 Google 官方 preview endpoint；已于 2026-05-25 shut down | 1,048,576 input tokens | 65,536 tokens | 支持 | 支持（Function calling） | 官方归档页确认支持 Thinking，但当前一手文档未继续单列该已停服 endpoint 的可选档位：**未确认** | **未确认** |
+| `gpt-5.5` | OpenAI 官方标准 model ID/alias；不含任何渠道前缀 | 1,050,000 tokens | 128,000 tokens | 支持（input only） | 支持：Function calling；Responses API 另支持 Web/File search、Image generation、Code interpreter、Hosted shell、Apply patch、Skills、Computer use、MCP、Tool search | `reasoning.effort`: `none` / `low` / `medium`（默认）/ `high` / `xhigh`；该型号页未列 `minimal` 或 `max` | 是；`reasoning.effort: "none"` |
+
+补充说明：
+
+- Anthropic 当前 Models overview 与 Context windows 页面将 `claude-sonnet-4-6` 的单请求上限列为 128k；`What's new in Claude 4.6` 页面仍残留“Sonnet 4.6 为 64k”的发布时描述，属于官方一手文档冲突。本表采用当前模型总表的 128k；如该值用于生产侧硬限制，应再以 Models API 返回的 `max_tokens` 或实际账户请求验证。Message Batches API 另可在携带 `output-300k-2026-03-24` beta header 时到 300k，不能当作同步 Messages API 默认值。
+- Google 有两套不同接口控制面：GenerateContent 使用数值型 `thinkingBudget`，Interactions 使用枚举型 `thinking_level`；它们不是同一个参数，不能混写。
+- “支持 Thinking”只证明模型具备思考能力，不自动证明某个档位或关闭方式可用。因此已停服 preview endpoint 的档位和关闭能力保持“未确认”。
+- `minimal` 与完全关闭不同：Google 明确写明 Gemini 3.x 的 `minimal` 不保证 thinking 为零。
+
+### CPA v7.2.128 的实际代理规格
+
+上表是厂商官方基础模型规格，不应直接覆盖到 CPA。当前 CPA `/v1/models` 返回的 `owned_by` 表明，这六个名称实际分成两条路由：
+
+- `claude-sonnet-4-6`、`gemini-3.1-flash-lite`：`antigravity`
+- `gemini-2.5-pro`、`gemini-2.5-flash`、`gemini-2.5-flash-lite`、`gemini-3.1-flash-lite-preview`：Google / `gemini-cli`
+
+本机镜像是 CLIProxyAPI `v7.2.128`、commit `bd34cec`。该 commit 的内置 registry 和 OpenAI translator 给出以下实际代理口径：
+
+| CPA 模型 | 实际路由 | CPA context / input | CPA max output | Kimi 可表达的有效 effort | Thinking Off |
+| --- | --- | ---: | ---: | --- | --- |
+| `claude-sonnet-4-6` | Antigravity | 200,000 | 64,000 | `low` / `medium` / `high` / `xhigh` / `max`；`minimal` 会钳制成 `low` | `none` 可关闭 |
+| `gemini-2.5-pro` | gemini-cli | 1,048,576 | 65,536 | `minimal` / `low` / `medium` / `high` / `xhigh`；`max` 会钳制成 `xhigh` | 不可关闭；`none` 会钳制到最小预算 128 |
+| `gemini-2.5-flash` | gemini-cli | 1,048,576 | 65,536 | `minimal` / `low` / `medium` / `high`；`xhigh` / `max` 会钳制成 `high` | `none` 可关闭 |
+| `gemini-2.5-flash-lite` | gemini-cli | 1,048,576 | 65,536 | `minimal` / `low` / `medium` / `high`；`xhigh` / `max` 会钳制成 `high` | `none` 可关闭 |
+| `gemini-3.1-flash-lite` | Antigravity | 1,048,576 | 65,535 | `minimal` / `low` / `medium` / `high` | `none` 可关闭（CPA registry 明确允许 zero） |
+| `gemini-3.1-flash-lite-preview` | gemini-cli | 1,048,576 | 65,536 | `minimal` / `low` / `medium` / `high` | 官方 3.1 模型不能完全关闭；省略配置会回到上游默认 |
+
+CLIProxyAPI 会先把 OpenAI `reasoning_effort` 映射为 thinking level，再按目标 provider 的 registry 转成 level 或 budget 并钳制。因此，Kimi 的 `support_efforts` 应列出上表中能产生不同实际效果的值，不应把会被钳制成同一档的值重复暴露。`none` 只应出现在确实能关闭 thinking 的模型上。
+
+CPA 的 OpenAI translator 会保留 function tools，并把 `image_url`、`video_url`、`input_audio` 转成 Gemini/Antigravity 的内联多模态 part。但 Kimi 的 `openai` provider 对用户音频生成的是非标准 `audio_url`，而 CPA translator 这里只处理 `input_audio`，所以当前组合只能可靠声明 `tool_use`、`image_in`、`video_in` 和 `thinking`，不能声明 `audio_in`。Claude 这条 Antigravity 路由只应声明 Claude 实际支持的 text/image、tool use 和 thinking，不能因 translator 能解析音视频就虚报模型能力。
+
+一手来源：
+
+- CPA registry（commit `bd34cec`）：https://github.com/router-for-me/CLIProxyAPI/blob/bd34cec/internal/registry/models/models.json
+- OpenAI → Antigravity translator：https://github.com/router-for-me/CLIProxyAPI/blob/bd34cec/internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go
+- OpenAI → Gemini translator：https://github.com/router-for-me/CLIProxyAPI/blob/bd34cec/internal/translator/gemini/openai/chat-completions/gemini_openai_request.go
+- level ↔ budget 映射：https://github.com/router-for-me/CLIProxyAPI/blob/bd34cec/internal/thinking/convert.go
+
+注意：`gemini-3.1-flash-lite-preview` 的 Google 官方 endpoint 已停服，但 CPA 仍将它列在 `/v1/models`。目录存在不等于端到端可调用；在不做真实 smoke test 的前提下，只能标记为“CPA 已注册、实际可用性未确认”，不能直接删除，也不能宣称仍可用。
+
+### 逐项官方来源
+
+- `claude-sonnet-4-6`
+  - Models overview（模型 ID、固定 snapshot、context、max output、image input）：https://platform.claude.com/docs/en/about-claude/models/overview
+  - Context windows（当前 1M/128k 口径）：https://platform.claude.com/docs/en/build-with-claude/context-windows
+  - Claude 4.6 发布页（64k 冲突项、adaptive/manual thinking）：https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-6
+  - Effort（可选值、默认值、`xhigh` 边界）：https://platform.claude.com/docs/en/build-with-claude/effort
+  - Adaptive thinking / thinking 开关：https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
+  - Tool use：https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview
+- `gemini-2.5-pro`
+  - 型号页：https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro
+  - GenerateContent thinking：https://ai.google.dev/gemini-api/docs/generate-content/thinking
+  - Interactions thinking：https://ai.google.dev/gemini-api/docs/thinking
+- `gemini-2.5-flash`
+  - 型号页：https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash
+  - GenerateContent thinking：https://ai.google.dev/gemini-api/docs/generate-content/thinking
+  - Interactions thinking：https://ai.google.dev/gemini-api/docs/thinking
+- `gemini-2.5-flash-lite`
+  - 型号页：https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-lite
+  - GenerateContent thinking：https://ai.google.dev/gemini-api/docs/generate-content/thinking
+  - Interactions thinking：https://ai.google.dev/gemini-api/docs/thinking
+- `gemini-3.1-flash-lite`
+  - 型号页：https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite
+  - Thinking levels 与 `minimal` 边界：https://ai.google.dev/gemini-api/docs/generate-content/thinking
+- `gemini-3.1-flash-lite-preview`
+  - 归档型号页：https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite-preview
+  - Changelog（2026-05-25 shut down）：https://ai.google.dev/gemini-api/docs/changelog
+- `gpt-5.5`
+  - 型号页（context、max output、modalities、tools、该型号 effort 精确集合）：https://developers.openai.com/api/docs/models/gpt-5.5
+  - Reasoning guide（`none` 语义、reasoning token 口径）：https://developers.openai.com/api/docs/guides/reasoning
+
+### 审计结论
+
+- 六个 CPA/Kimi 名称均是当前或历史上真实存在的 Google/Anthropic 官方 exact ID；其中五个当前仍可用，`gemini-3.1-flash-lite-preview` 已停服，不能再当作可用模型。
+- 标准 OpenAI `gpt-5.5` 的规格只能用于精确的官方名称 `gpt-5.5`；`codex/`、`cx/` 或其他渠道前缀版本仍是未确认的代理 alias。
+- 官方基础模型的上限与能力不等于 CPA/Kimi 代理层的实际值；代理可能进一步裁剪 context/output、模态、工具或推理档位，必须以渠道一手证据或端到端实测为准。
