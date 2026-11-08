@@ -222,16 +222,25 @@ jobs:
 
       - name: Build FreeBSD shared library
         timeout-minutes: 45
-        uses: go-cross/cgo-actions@v1
-        env:
-          GOFLAGS: -trimpath -buildmode=c-shared
-        with:
-          dir: .
-          packages: .
-          targets: freebsd-${{ matrix.goarch }}
-          out-dir: dist/freebsd-${{ matrix.goarch }}
-          output: ${{ env.PLUGIN_ID }}.so
-          flags: -ldflags=-s -w
+        run: |
+          set -euo pipefail
+          FREEBSD_VERSION=14.4
+          SYSROOT="${PWD}/freebsd-sysroot"
+          wget -q --show-progress \
+            "https://download.freebsd.org/releases/amd64/${FREEBSD_VERSION}-RELEASE/base.txz" \
+            -O freebsd-base.txz
+          mkdir -p "${SYSROOT}"
+          sudo tar -xf freebsd-base.txz -C "${SYSROOT}"
+          rm -f freebsd-base.txz
+          mkdir -p "dist/freebsd-${{ matrix.goarch }}"
+          CGO_ENABLED=1 \
+            GOOS=freebsd \
+            GOARCH=${{ matrix.goarch }} \
+            CGO_LDFLAGS=-fuse-ld=lld \
+            CC="clang --target=x86_64-unknown-freebsd${FREEBSD_VERSION} --sysroot=${SYSROOT}" \
+            go build -trimpath -buildmode=c-shared \
+              -ldflags "-s -w" \
+              -o "dist/freebsd-${{ matrix.goarch }}/${PLUGIN_ID}.so" .
 
       - name: Package plugin
         run: |
