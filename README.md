@@ -26,7 +26,7 @@ HTTP 403 propagation for after-auth blocking requires CLIProxyAPI v7.3.2 or newe
 
 The built-in preset is enabled by default and covers major AI coding editors, assistants, terminal agents, and related general-purpose agents:
 
-- Claude Code, OpenAI Codex / Codex CLI, OpenCode
+- Claude Agent, Claude Code, OpenAI Codex / Codex CLI, OpenCode
 - GitHub Copilot / Copilot CLI, Gemini Code Assist / Gemini CLI
 - Cursor, Windsurf / Codeium, Cline, Roo Code, Kilo Code, Aider, Continue.dev
 - Amazon Q Developer / CodeWhisperer, JetBrains AI Assistant / Junie, Kiro
