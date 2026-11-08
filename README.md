@@ -4,14 +4,23 @@ CLIProxyAPI v7 dynamic plugin for blocking or rewriting non-Antigravity coding s
 
 ## Filter Modes
 
-The plugin detects configured coding-client names when they appear inside JSON fields named `system`. Choose how matches are handled with `mode`:
+The plugin inspects only system/developer prompt text after CLIProxyAPI has selected the upstream format. Choose how matches are handled with `mode`:
 
 - `block` (default): reject the entire request with HTTP `403 Forbidden` and a `blocked_by_antigravity_coding_filter` error.
 - `rewrite`: replace matched names with `Antigravity` and forward the request.
 
-Matching is case-insensitive and only scans `system`. Mentions in user prompts, `messages`, or other fields do not trigger the filter.
+Matching is case-insensitive. The eligible locations are:
 
-HTTP 403 propagation requires CLIProxyAPI v7.2.93 or newer. Earlier hosts do not understand the plugin RPC `http_status` error field.
+- Anthropic `system` text and text blocks.
+- OpenAI Responses `instructions`, plus `input` messages whose role is `system` or `developer`, including `input_text` blocks.
+- OpenAI Chat Completions `messages` whose role is `system` or `developer`, including string and `text` block content.
+- Gemini `systemInstruction.parts[].text` and `system_instruction.parts[].text`, including the Antigravity `request` wrapper.
+
+User and assistant messages, tool definitions/results, image data, metadata, and other JSON fields are preserved. Technical references such as URLs, paths, `CODEX.md`, `.codex`, and `mcp__...` identifiers are preserved even when they occur inside an eligible prompt. Markdown emphasis around a name does not prevent a configured name from being rewritten.
+
+The before-auth interceptor and model router are pass-through hooks. The filter runs in `request.intercept_after` only when CLIProxyAPI reports `ToFormat: "antigravity"`; other upstream providers are untouched.
+
+HTTP 403 propagation for after-auth blocking requires CLIProxyAPI v7.3.2 or newer, which provides interceptor termination fields. Earlier hosts do not understand the plugin RPC termination response.
 
 ## Built-in Keywords
 

@@ -142,7 +142,7 @@ custom_mappings:
 	}
 }
 
-func TestHandlePluginCallRequestInterceptBeforeRewritesCodingSignals(t *testing.T) {
+func TestHandlePluginCallRequestInterceptBeforeLeavesRequestsUntouched(t *testing.T) {
 	defer restoreDefaultFilterConfig(t)
 	applyFilterConfig(filterConfig{Mode: filterModeRewrite, UseDefaultKeywords: true})
 
@@ -163,12 +163,8 @@ func TestHandlePluginCallRequestInterceptBeforeRewritesCodingSignals(t *testing.
 	if !envelope.OK {
 		t.Fatalf("ok = false, want true")
 	}
-	body, err := base64.StdEncoding.DecodeString(envelope.Result.Body)
-	if err != nil {
-		t.Fatalf("decode body: %v", err)
-	}
-	if !strings.Contains(string(body), "You are Antigravity.") {
-		t.Fatalf("body = %s, want rewritten system", body)
+	if envelope.Result.Body != "" {
+		t.Fatalf("body = %q, want empty body before provider selection", envelope.Result.Body)
 	}
 }
 
@@ -194,7 +190,89 @@ func TestHandlePluginCallRequestInterceptBeforeDoesNotRewriteInDefaultBlockMode(
 	}
 }
 
-func TestHandlePluginCallModelRouteBlocksMatchedRequestsByDefault(t *testing.T) {
+func TestHandlePluginCallRequestInterceptAfterRewritesOnlyAntigravityRequests(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	applyFilterConfig(filterConfig{Mode: filterModeRewrite, UseDefaultKeywords: true})
+
+	tests := []struct {
+		name     string
+		toFormat string
+		wantBody string
+	}{
+		{name: "antigravity", toFormat: "antigravity", wantBody: `{"system":"You are Antigravity."}`},
+		{name: "case insensitive antigravity", toFormat: "ANTIGRAVITY", wantBody: `{"system":"You are Antigravity."}`},
+		{name: "other provider", toFormat: "openai", wantBody: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, code := handlePluginCall("request.intercept_after", requestInterceptRequestJSONForFormat(t, tt.toFormat, `{"system":"You are Codex."}`))
+			if code != 0 {
+				t.Fatalf("code = %d, want 0; body=%s", code, raw)
+			}
+			var envelope struct {
+				OK     bool `json:"ok"`
+				Result struct {
+					Body string `json:"Body"`
+				} `json:"result"`
+			}
+			mustUnmarshalJSON(t, raw, &envelope)
+			if !envelope.OK {
+				t.Fatalf("ok = false, want true; body=%s", raw)
+			}
+			if tt.wantBody == "" {
+				if envelope.Result.Body != "" {
+					t.Fatalf("body = %q, want unchanged request", envelope.Result.Body)
+				}
+				return
+			}
+			body, err := base64.StdEncoding.DecodeString(envelope.Result.Body)
+			if err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if string(body) != tt.wantBody {
+				t.Fatalf("body = %s, want %s", body, tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestHandlePluginCallRequestInterceptAfterBlocksEligibleAntigravityRequests(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	applyFilterConfig(defaultFilterConfig())
+
+	raw, code := handlePluginCall("request.intercept_after", requestInterceptRequestJSONForFormat(t, "antigravity", `{"messages":[{"role":"developer","content":"You are Codex."}]}`))
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; body=%s", code, raw)
+	}
+	var envelope struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Terminate       bool                `json:"Terminate"`
+			StatusCode      int                 `json:"StatusCode"`
+			ResponseBody    string              `json:"ResponseBody"`
+			ResponseHeaders map[string][]string `json:"ResponseHeaders"`
+		} `json:"result"`
+	}
+	mustUnmarshalJSON(t, raw, &envelope)
+	if !envelope.OK || !envelope.Result.Terminate {
+		t.Fatalf("response = %s, want terminated request", raw)
+	}
+	if envelope.Result.StatusCode != 403 {
+		t.Fatalf("status = %d, want 403", envelope.Result.StatusCode)
+	}
+	if got := envelope.Result.ResponseHeaders["content-type"]; len(got) != 1 || got[0] != "application/json" {
+		t.Fatalf("headers = %#v, want JSON content type", envelope.Result.ResponseHeaders)
+	}
+	body, err := base64.StdEncoding.DecodeString(envelope.Result.ResponseBody)
+	if err != nil {
+		t.Fatalf("decode response body: %v", err)
+	}
+	if !strings.Contains(string(body), blockErrorCode) {
+		t.Fatalf("response body = %s, want block error", body)
+	}
+}
+
+func TestHandlePluginCallModelRouteLeavesProviderSelectionUntouched(t *testing.T) {
 	defer restoreDefaultFilterConfig(t)
 	applyFilterConfig(defaultFilterConfig())
 
@@ -213,14 +291,8 @@ func TestHandlePluginCallModelRouteBlocksMatchedRequestsByDefault(t *testing.T) 
 		} `json:"result"`
 	}
 	mustUnmarshalJSON(t, raw, &envelope)
-	if !envelope.OK || !envelope.Result.Handled {
-		t.Fatalf("response = %s, want handled block route", raw)
-	}
-	if envelope.Result.TargetKind != "self" {
-		t.Fatalf("TargetKind = %q, want self", envelope.Result.TargetKind)
-	}
-	if !strings.Contains(envelope.Result.Reason, "system.keyword:qoder") {
-		t.Fatalf("Reason = %q, want qoder keyword detail", envelope.Result.Reason)
+	if !envelope.OK || envelope.Result.Handled {
+		t.Fatalf("response = %s, want unhandled route", raw)
 	}
 }
 
@@ -374,10 +446,14 @@ func TestHandlePluginCallUnknownMethodReturnsErrorEnvelope(t *testing.T) {
 }
 
 func requestInterceptRequestJSON(t *testing.T, body string) []byte {
+	return requestInterceptRequestJSONForFormat(t, "", body)
+}
+
+func requestInterceptRequestJSONForFormat(t *testing.T, toFormat, body string) []byte {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{
 		"SourceFormat":   "openai",
-		"ToFormat":       "",
+		"ToFormat":       toFormat,
 		"Model":          "antigravity/test",
 		"RequestedModel": "antigravity/test",
 		"Body":           []byte(body),

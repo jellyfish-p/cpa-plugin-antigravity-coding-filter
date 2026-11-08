@@ -41,6 +41,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -55,7 +56,7 @@ const abiVersion = 1
 
 const (
 	pluginName       = "antigravity-coding-filter"
-	pluginVersion    = "0.2.1"
+	pluginVersion    = "0.3.0"
 	pluginRepository = "https://github.com/jellyfish-p/cpa-plugin-antigravity-coding-filter"
 )
 
@@ -137,7 +138,7 @@ func handlePluginCall(method string, request []byte) ([]byte, int) {
 	case pluginabi.MethodRequestInterceptBefore:
 		return handleRequestInterceptBefore(request), 0
 	case pluginabi.MethodRequestInterceptAfter:
-		return mustEnvelope(pluginapi.RequestInterceptResponse{}), 0
+		return handleRequestInterceptAfter(request), 0
 	default:
 		return mustErrorEnvelope("unknown_method", fmt.Sprintf("unknown method %q", method)), 0
 	}
@@ -210,31 +211,16 @@ func configFields() []pluginapi.ConfigField {
 		{
 			Name:        "custom_mappings",
 			Type:        pluginapi.ConfigFieldTypeObject,
-			Description: "Additional case-insensitive system-field mappings. Keys are blocked in block mode and rewritten to their values in rewrite mode.",
+			Description: "Additional case-insensitive system/developer prompt mappings. Keys are blocked in block mode and rewritten to their values in rewrite mode.",
 		},
 	}
 }
 
 func handleModelRoute(request []byte) []byte {
-	var req pluginapi.ModelRouteRequest
-	if err := json.Unmarshal(request, &req); err != nil {
-		return mustErrorEnvelope("invalid_request", fmt.Sprintf("decode model.route request: %v", err))
-	}
-
-	cfg := activeFilterConfig()
-	if cfg.Mode != filterModeBlock {
-		return mustEnvelope(pluginapi.ModelRouteResponse{Handled: false})
-	}
-	decision := classifyRequestWithConfig(req.Body, cfg)
-	if !decision.Blocked {
-		return mustEnvelope(pluginapi.ModelRouteResponse{Handled: false})
-	}
-
-	return mustEnvelope(pluginapi.ModelRouteResponse{
-		Handled:    true,
-		TargetKind: pluginapi.ModelRouteTargetSelf,
-		Reason:     fmt.Sprintf("%s:%s", decision.Signal, decision.Detail),
-	})
+	// Provider selection must happen before this filter runs.  The after-auth
+	// interceptor below is the first hook that knows whether the selected
+	// provider is Antigravity, so routing is deliberately left untouched.
+	return mustEnvelope(pluginapi.ModelRouteResponse{Handled: false})
 }
 
 const (
@@ -270,9 +256,30 @@ func handleRequestInterceptBefore(request []byte) []byte {
 	if err := json.Unmarshal(request, &req); err != nil {
 		return mustErrorEnvelope("invalid_request", fmt.Sprintf("decode request.intercept_before request: %v", err))
 	}
-	cfg := activeFilterConfig()
-	if cfg.Mode != filterModeRewrite {
+	return mustEnvelope(pluginapi.RequestInterceptResponse{})
+}
+
+func handleRequestInterceptAfter(request []byte) []byte {
+	var req pluginapi.RequestInterceptRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return mustErrorEnvelope("invalid_request", fmt.Sprintf("decode request.intercept_after request: %v", err))
+	}
+	if !strings.EqualFold(strings.TrimSpace(req.ToFormat), "antigravity") {
 		return mustEnvelope(pluginapi.RequestInterceptResponse{})
+	}
+
+	cfg := activeFilterConfig()
+	if cfg.Mode == filterModeBlock {
+		decision := classifyRequestWithConfig(req.Body, cfg)
+		if !decision.Blocked {
+			return mustEnvelope(pluginapi.RequestInterceptResponse{})
+		}
+		return mustEnvelope(pluginapi.RequestInterceptResponse{
+			Terminate:       true,
+			StatusCode:      http.StatusForbidden,
+			ResponseHeaders: jsonHeaders(),
+			ResponseBody:    blockPayload(),
+		})
 	}
 
 	body, rewritten := rewriteRequestBodyWithConfig(req.Body, cfg)
@@ -582,18 +589,14 @@ func classifyRequestWithConfig(body []byte, cfg filterConfig) filterDecision {
 
 	mappings := effectiveMappings(cfg)
 	var decision filterDecision
-	walkJSON(root, func(path []string, value any) bool {
-		if len(path) == 0 || path[len(path)-1] != "system" {
-			return true
+	transformEligiblePromptFields(root, func(text string) (string, bool) {
+		if decision.Blocked {
+			return text, false
 		}
-		text := strings.ToLower(collectText(value))
-		for _, mapping := range mappings {
-			if strings.Contains(text, mapping.Match) {
-				decision = filterDecision{Blocked: true, Signal: "system.keyword", Detail: mapping.Match}
-				return false
-			}
+		if mapping, protected := findEligibleMapping(text, mappings); protected {
+			decision = filterDecision{Blocked: true, Signal: "system.keyword", Detail: mapping.Match}
 		}
-		return true
+		return text, false
 	})
 	return decision
 }
@@ -607,7 +610,10 @@ func rewriteRequestBodyWithConfig(body []byte, cfg filterConfig) ([]byte, bool) 
 	if err := json.Unmarshal(body, &root); err != nil {
 		return nil, false
 	}
-	rewritten, changed := rewriteSystemFields(root, effectiveMappings(cfg))
+	mappings := effectiveMappings(cfg)
+	rewritten, changed := transformEligiblePromptFields(root, func(text string) (string, bool) {
+		return rewritePromptText(text, mappings)
+	})
 	if !changed {
 		return nil, false
 	}
@@ -618,20 +624,21 @@ func rewriteRequestBodyWithConfig(body []byte, cfg filterConfig) ([]byte, bool) 
 	return raw, true
 }
 
+// These helpers keep the original classifier/rewrite seams available to
+// callers that used the pre-protocol implementation directly. The runtime
+// entry points above use the narrower protocol-aware traversal.
 func rewriteSystemFields(value any, mappings []rewriteMapping) (any, bool) {
 	switch typed := value.(type) {
 	case map[string]any:
 		changed := false
 		for key, child := range typed {
+			var next any
+			var childChanged bool
 			if key == "system" {
-				next, childChanged := rewriteSystemValue(child, mappings)
-				if childChanged {
-					typed[key] = next
-					changed = true
-				}
-				continue
+				next, childChanged = rewriteSystemValue(child, mappings)
+			} else {
+				next, childChanged = rewriteSystemFields(child, mappings)
 			}
-			next, childChanged := rewriteSystemFields(child, mappings)
 			if childChanged {
 				typed[key] = next
 				changed = true
@@ -640,10 +647,10 @@ func rewriteSystemFields(value any, mappings []rewriteMapping) (any, bool) {
 		return typed, changed
 	case []any:
 		changed := false
-		for i, child := range typed {
+		for index, child := range typed {
 			next, childChanged := rewriteSystemFields(child, mappings)
 			if childChanged {
-				typed[i] = next
+				typed[index] = next
 				changed = true
 			}
 		}
@@ -656,14 +663,7 @@ func rewriteSystemFields(value any, mappings []rewriteMapping) (any, bool) {
 func rewriteSystemValue(value any, mappings []rewriteMapping) (any, bool) {
 	switch typed := value.(type) {
 	case string:
-		next := typed
-		changed := false
-		for _, mapping := range mappings {
-			var replaced bool
-			next, replaced = replaceInsensitive(next, mapping.Match, mapping.Replacement)
-			changed = changed || replaced
-		}
-		return next, changed
+		return rewritePromptText(typed, mappings)
 	case map[string]any:
 		changed := false
 		for key, child := range typed {
@@ -676,10 +676,10 @@ func rewriteSystemValue(value any, mappings []rewriteMapping) (any, bool) {
 		return typed, changed
 	case []any:
 		changed := false
-		for i, child := range typed {
+		for index, child := range typed {
 			next, childChanged := rewriteSystemValue(child, mappings)
 			if childChanged {
-				typed[i] = next
+				typed[index] = next
 				changed = true
 			}
 		}
@@ -689,12 +689,261 @@ func rewriteSystemValue(value any, mappings []rewriteMapping) (any, bool) {
 	}
 }
 
-func replaceInsensitive(value, match, replacement string) (string, bool) {
+// transformEligiblePromptFields visits only protocol-defined system/developer
+// prompt text. It intentionally does not recurse through arbitrary JSON: user
+// messages, tool payloads, identifiers, and metadata must remain untouched.
+func transformEligiblePromptFields(root any, transform func(string) (string, bool)) (any, bool) {
+	return transformPromptObject(root, true, transform)
+}
+
+func transformPromptObject(value any, allowPromptFields bool, transform func(string) (string, bool)) (any, bool) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return value, false
+	}
+	changed := false
+	if allowPromptFields {
+		for _, key := range []string{"system", "instructions"} {
+			child, exists := object[key]
+			if !exists {
+				continue
+			}
+			next, childChanged := transformPromptTextContainer(child, transform)
+			if childChanged {
+				object[key] = next
+				changed = true
+			}
+		}
+		for _, key := range []string{"input", "messages"} {
+			child, exists := object[key]
+			if !exists {
+				continue
+			}
+			next, childChanged := transformRoleMessages(child, transform)
+			if childChanged {
+				object[key] = next
+				changed = true
+			}
+		}
+		for _, key := range []string{"systemInstruction", "system_instruction"} {
+			child, exists := object[key]
+			if !exists {
+				continue
+			}
+			next, childChanged := transformGeminiSystemInstruction(child, transform)
+			if childChanged {
+				object[key] = next
+				changed = true
+			}
+		}
+	}
+
+	// CPA may wrap the original request in an Antigravity `request` object.
+	// Re-enter only that protocol wrapper instead of scanning every nested map.
+	if child, exists := object["request"]; exists {
+		next, childChanged := transformPromptObject(child, true, transform)
+		if childChanged {
+			object["request"] = next
+			changed = true
+		}
+	}
+	return object, changed
+}
+
+func transformPromptTextContainer(value any, transform func(string) (string, bool)) (any, bool) {
+	switch typed := value.(type) {
+	case string:
+		return transform(typed)
+	case []any:
+		changed := false
+		for index, child := range typed {
+			next, childChanged := transformPromptTextContainer(child, transform)
+			if childChanged {
+				typed[index] = next
+				changed = true
+			}
+		}
+		return typed, changed
+	case map[string]any:
+		// Anthropic and Responses text blocks carry their prompt in `text`.
+		if text, ok := typed["text"].(string); ok {
+			next, childChanged := transform(text)
+			if childChanged {
+				typed["text"] = next
+			}
+			return typed, childChanged
+		}
+	}
+	return value, false
+}
+
+func transformRoleMessages(value any, transform func(string) (string, bool)) (any, bool) {
+	switch typed := value.(type) {
+	case []any:
+		changed := false
+		for index, child := range typed {
+			next, childChanged := transformRoleMessage(child, transform)
+			if childChanged {
+				typed[index] = next
+				changed = true
+			}
+		}
+		return typed, changed
+	case map[string]any:
+		return transformRoleMessage(typed, transform)
+	default:
+		return value, false
+	}
+}
+
+func transformRoleMessage(value any, transform func(string) (string, bool)) (any, bool) {
+	message, ok := value.(map[string]any)
+	if !ok {
+		return value, false
+	}
+	role, _ := message["role"].(string)
+	role = strings.ToLower(strings.TrimSpace(role))
+	if role != "system" && role != "developer" {
+		return value, false
+	}
+	content, exists := message["content"]
+	if !exists {
+		return value, false
+	}
+	next, changed := transformMessageContent(content, transform)
+	if changed {
+		message["content"] = next
+	}
+	return message, changed
+}
+
+func transformMessageContent(value any, transform func(string) (string, bool)) (any, bool) {
+	switch typed := value.(type) {
+	case string:
+		return transform(typed)
+	case []any:
+		changed := false
+		for index, child := range typed {
+			block, ok := child.(map[string]any)
+			if !ok {
+				continue
+			}
+			blockType, _ := block["type"].(string)
+			blockType = strings.ToLower(strings.TrimSpace(blockType))
+			if blockType != "text" && blockType != "input_text" {
+				continue
+			}
+			text, ok := block["text"].(string)
+			if !ok {
+				continue
+			}
+			next, childChanged := transform(text)
+			if childChanged {
+				block["text"] = next
+				typed[index] = block
+				changed = true
+			}
+		}
+		return typed, changed
+	case map[string]any:
+		blockType, _ := typed["type"].(string)
+		blockType = strings.ToLower(strings.TrimSpace(blockType))
+		if blockType != "text" && blockType != "input_text" {
+			return value, false
+		}
+		text, ok := typed["text"].(string)
+		if !ok {
+			return value, false
+		}
+		next, changed := transform(text)
+		if changed {
+			typed["text"] = next
+		}
+		return typed, changed
+	default:
+		return value, false
+	}
+}
+
+func transformGeminiSystemInstruction(value any, transform func(string) (string, bool)) (any, bool) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return value, false
+	}
+	parts, ok := object["parts"].([]any)
+	if !ok {
+		return value, false
+	}
+	changed := false
+	for index, part := range parts {
+		partObject, ok := part.(map[string]any)
+		if !ok {
+			continue
+		}
+		text, ok := partObject["text"].(string)
+		if !ok {
+			continue
+		}
+		next, partChanged := transform(text)
+		if partChanged {
+			partObject["text"] = next
+			parts[index] = partObject
+			changed = true
+		}
+	}
+	return object, changed
+}
+
+func findEligibleMapping(text string, mappings []rewriteMapping) (rewriteMapping, bool) {
+	for _, mapping := range mappings {
+		if containsUnprotected(text, mapping.Match) {
+			return mapping, true
+		}
+	}
+	return rewriteMapping{}, false
+}
+
+func rewritePromptText(value string, mappings []rewriteMapping) (string, bool) {
+	next := value
+	changed := false
+	for _, mapping := range mappings {
+		var replaced bool
+		next, replaced = replaceInsensitiveProtected(next, mapping.Match, mapping.Replacement)
+		changed = changed || replaced
+	}
+	return next, changed
+}
+
+func containsUnprotected(value, match string) bool {
+	lowerValue := strings.ToLower(value)
+	lowerMatch := strings.ToLower(match)
+	if lowerMatch == "" {
+		return false
+	}
+	protected := protectedTextRanges(value)
+	for start := 0; ; {
+		index := strings.Index(lowerValue[start:], lowerMatch)
+		if index < 0 {
+			return false
+		}
+		index += start
+		if !overlapsProtected(index, index+len(match), protected) {
+			return true
+		}
+		start = index + len(match)
+		if start > len(value) {
+			return false
+		}
+	}
+}
+
+func replaceInsensitiveProtected(value, match, replacement string) (string, bool) {
 	if match == "" {
 		return value, false
 	}
 	lowerValue := strings.ToLower(value)
 	lowerMatch := strings.ToLower(match)
+	protected := protectedTextRanges(value)
 	var builder strings.Builder
 	start := 0
 	changed := false
@@ -705,15 +954,60 @@ func replaceInsensitive(value, match, replacement string) (string, bool) {
 		}
 		index += start
 		builder.WriteString(value[start:index])
-		builder.WriteString(replacement)
-		start = index + len(match)
-		changed = true
+		end := index + len(match)
+		if overlapsProtected(index, end, protected) {
+			builder.WriteString(value[index:end])
+		} else {
+			builder.WriteString(replacement)
+			changed = true
+		}
+		start = end
 	}
 	if !changed {
 		return value, false
 	}
 	builder.WriteString(value[start:])
 	return builder.String(), true
+}
+
+func replaceInsensitive(value, match, replacement string) (string, bool) {
+	return replaceInsensitiveProtected(value, match, replacement)
+}
+
+type textRange struct {
+	start int
+	end   int
+}
+
+var protectedTextPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(?:https?|ftp)://[^\s"'<>]+`),
+	regexp.MustCompile(`(?i)\bmcp(?:__|\\_\\_)[A-Za-z0-9][A-Za-z0-9_\\-]*`),
+	regexp.MustCompile(`(?i)\b[A-Za-z]:[\\/][^\s"'<>]+`),
+	regexp.MustCompile(`(?:\\\\|//)[^\s"'<>]+`),
+	regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])/(?:[^\s"'<>/]+/)+[^\s"'<>]*`),
+	regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9._~-]+[\\/])+[A-Za-z0-9._~-]+`),
+	regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?:~|\.{1,2})[\\/][^\s"'<>]+`),
+	regexp.MustCompile(`(?i)\.codex(?:[^A-Za-z0-9]|$)`),
+	regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]+\.(?:md|markdown)`),
+}
+
+func protectedTextRanges(value string) []textRange {
+	var ranges []textRange
+	for _, pattern := range protectedTextPatterns {
+		for _, match := range pattern.FindAllStringIndex(value, -1) {
+			ranges = append(ranges, textRange{start: match[0], end: match[1]})
+		}
+	}
+	return ranges
+}
+
+func overlapsProtected(start, end int, ranges []textRange) bool {
+	for _, protected := range ranges {
+		if start < protected.end && protected.start < end {
+			return true
+		}
+	}
+	return false
 }
 
 func walkJSON(value any, visit func(path []string, value any) bool) {
