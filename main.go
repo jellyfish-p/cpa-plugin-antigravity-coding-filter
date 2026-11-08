@@ -56,7 +56,7 @@ const abiVersion = 1
 
 const (
 	pluginName       = "antigravity-coding-filter"
-	pluginVersion    = "0.3.0"
+	pluginVersion    = "0.3.1"
 	pluginRepository = "https://github.com/jellyfish-p/cpa-plugin-antigravity-coding-filter"
 )
 
@@ -323,6 +323,7 @@ func mustRawMessage(value any) json.RawMessage {
 
 var defaultRewriteMappings = []rewriteMapping{
 	// Major AI code editors, assistants, and terminal coding agents.
+	{Match: "Claude Agent", Replacement: "Antigravity"},
 	{Match: "Claude Code", Replacement: "Antigravity"},
 	{Match: "OpenAI Codex", Replacement: "Antigravity"},
 	{Match: "Codex CLI", Replacement: "Antigravity"},
