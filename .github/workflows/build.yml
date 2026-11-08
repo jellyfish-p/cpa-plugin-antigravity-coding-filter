@@ -110,7 +110,7 @@ jobs:
             -checksum "${ARCHIVE_NAME}.sha256"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
@@ -150,16 +150,27 @@ jobs:
 
       - name: Build Windows ARM64 shared library
         timeout-minutes: 45
-        uses: go-cross/cgo-actions@v1
-        env:
-          GOFLAGS: -trimpath -buildmode=c-shared
-        with:
-          dir: .
-          packages: .
-          targets: windows-arm64
-          out-dir: dist/windows-arm64
-          output: ${{ env.PLUGIN_ID }}.dll
-          flags: -ldflags=-s -w
+        run: |
+          set -euo pipefail
+          sudo snap install zig --classic --beta
+          sudo tee /usr/local/bin/zcc >/dev/null <<'EOF'
+          #!/bin/sh
+          exec zig cc -target aarch64-windows-gnu "$@"
+          EOF
+          sudo tee /usr/local/bin/z++ >/dev/null <<'EOF'
+          #!/bin/sh
+          exec zig c++ -target aarch64-windows-gnu "$@"
+          EOF
+          sudo chmod +x /usr/local/bin/zcc /usr/local/bin/z++
+          mkdir -p dist/windows-arm64
+          CGO_ENABLED=1 \
+            GOOS=windows \
+            GOARCH=arm64 \
+            CC=zcc \
+            CXX=z++ \
+            go build -trimpath -buildmode=c-shared \
+              -ldflags "-s -w" \
+              -o "dist/windows-arm64/${PLUGIN_ID}.dll" .
 
       - name: Package plugin
         run: |
@@ -171,7 +182,7 @@ jobs:
             -checksum "${ARCHIVE_NAME}.sha256"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
@@ -252,7 +263,7 @@ jobs:
             -checksum "${ARCHIVE_NAME}.sha256"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
@@ -270,7 +281,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
