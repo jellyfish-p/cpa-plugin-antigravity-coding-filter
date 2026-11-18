@@ -29,14 +29,14 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Test plugin
-        run: go test ./...
+      - name: Test plugin and release packaging helper
+        run: go test ./... ./.github/scripts
 
-      - name: Test release packaging helper
-        run: go test ./.github/scripts
+      - name: Test release publishing
+        run: bash .github/scripts/publish-release_test.sh
 
       - name: Vet
-        run: go vet ./...
+        run: go vet ./... ./.github/scripts
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
@@ -229,20 +229,24 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y clang lld wget
+          sudo apt-get install -y clang lld
 
       - name: Build FreeBSD shared library
         timeout-minutes: 45
         run: |
           set -euo pipefail
           FREEBSD_VERSION=14.4
-          SYSROOT="${PWD}/freebsd-sysroot"
-          wget -q --show-progress \
-            "https://download.freebsd.org/releases/amd64/${FREEBSD_VERSION}-RELEASE/base.txz" \
-            -O freebsd-base.txz
+          FREEBSD_BASE_SHA256=769f60a6eea2938ad6b7943cfbcc17dfaf7d1f7ba59a32b869a00349302df853
+          BASE_ARCHIVE="${RUNNER_TEMP}/freebsd-base.txz"
+          SYSROOT="${RUNNER_TEMP}/freebsd-sysroot"
+          curl_options=(--fail --location --connect-timeout 20 --max-time 300
+                        --retry 3 --retry-max-time 360 --output "${BASE_ARCHIVE}")
+          if ! curl "${curl_options[@]}" "https://download.freebsd.org/releases/amd64/${FREEBSD_VERSION}-RELEASE/base.txz"; then
+            curl "${curl_options[@]}" "https://archive.freebsd.org/old-releases/amd64/amd64/${FREEBSD_VERSION}-RELEASE/base.txz"
+          fi
+          printf '%s  %s\n' "${FREEBSD_BASE_SHA256}" "${BASE_ARCHIVE}" | sha256sum --strict --check
           mkdir -p "${SYSROOT}"
-          sudo tar -xf freebsd-base.txz -C "${SYSROOT}"
-          rm -f freebsd-base.txz
+          sudo tar -xf "${BASE_ARCHIVE}" -C "${SYSROOT}"
           mkdir -p "dist/freebsd-${{ matrix.goarch }}"
           CGO_ENABLED=1 \
             GOOS=freebsd \
@@ -271,9 +275,8 @@ jobs:
             ${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
 
-  release:
-    name: Release
-    if: startsWith(github.ref, 'refs/tags/v')
+  verify-artifacts:
+    name: Verify build artifacts
     needs:
       - build
       - build-windows-arm64
@@ -286,19 +289,54 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Verify archives and checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          version=0.0.0-dev
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          targets=(linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64 windows_arm64 freebsd_amd64)
+          archives=(*.zip)
+          checksums=(*.zip.sha256)
+          if (( ${#archives[@]} != ${#targets[@]} || ${#checksums[@]} != ${#targets[@]} )); then
+            echo "Expected ${#targets[@]} archives and checksums, found ${#archives[@]} archives and ${#checksums[@]} checksums" >&2
+            exit 1
+          fi
+          for target in "${targets[@]}"; do
+            case "${target%%_*}" in
+              darwin) ext=dylib ;;
+              windows) ext=dll ;;
+              *) ext=so ;;
+            esac
+            archive="${PLUGIN_ID}_${version}_${target}.zip"
+            sha256sum --text "${archive}" | diff - "${archive}.sha256"
+            unzip -tq "${archive}"
+            if [[ "$(unzip -Z1 "${archive}")" != "${PLUGIN_ID}.${ext}" ]]; then
+              echo "${archive} must contain only ${PLUGIN_ID}.${ext}" >&2
+              exit 1
+            fi
+          done
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify-artifacts
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          sort dist/*.sha256 > dist/checksums.txt
-          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt --clobber --repo "${GITHUB_REPOSITORY}"
-          else
-            gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt \
-              --repo "${GITHUB_REPOSITORY}" \
-              --verify-tag \
-              --title "${GITHUB_REF_NAME}" \
-              --notes "Automated release for ${GITHUB_REF_NAME}."
-          fi
+        run: bash .github/scripts/publish-release.sh

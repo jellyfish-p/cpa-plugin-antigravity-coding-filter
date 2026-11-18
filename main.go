@@ -38,10 +38,13 @@ extern void cliproxy_plugin_shutdown(void);
 import "C"
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -204,6 +207,11 @@ func configFields() []pluginapi.ConfigField {
 			Description: "How matched requests are handled: block rejects the request (default); rewrite replaces matched names with Antigravity.",
 		},
 		{
+			Name:        "rewrite_scope",
+			Type:        pluginapi.ConfigFieldTypeArray,
+			Description: fmt.Sprintf("Select any combination of %s. Defaults to [\"system\"]. Only used in rewrite mode.", strings.Join(rewriteBlockNames(), ", ")),
+		},
+		{
 			Name:        "use_default_keywords",
 			Type:        pluginapi.ConfigFieldTypeBoolean,
 			Description: "Enable the built-in coding software and agent keyword preset.",
@@ -211,7 +219,7 @@ func configFields() []pluginapi.ConfigField {
 		{
 			Name:        "custom_mappings",
 			Type:        pluginapi.ConfigFieldTypeObject,
-			Description: "Additional case-insensitive system/developer prompt mappings. Keys are blocked in block mode and rewritten to their values in rewrite mode.",
+			Description: "Additional case-insensitive mappings. Block mode checks keys in system/developer prompts. Rewrite mode replaces keys in the selected rewrite scope.",
 		},
 	}
 }
@@ -321,7 +329,7 @@ func mustRawMessage(value any) json.RawMessage {
 	return raw
 }
 
-var defaultRewriteMappings = []rewriteMapping{
+var defaultRewriteMappings = normalizeMappings([]rewriteMapping{
 	// Major AI code editors, assistants, and terminal coding agents.
 	{Match: "Claude Agent", Replacement: "Antigravity"},
 	{Match: "Claude Code", Replacement: "Antigravity"},
@@ -381,7 +389,13 @@ var defaultRewriteMappings = []rewriteMapping{
 	{Match: "Hermes Agent", Replacement: "Antigravity"},
 	{Match: "Hermes", Replacement: "Antigravity"},
 	{Match: "WorkBuddy", Replacement: "Antigravity"},
-}
+})
+
+var defaultSystemPromptMappings = normalizeMappings([]rewriteMapping{
+	// DeepSeek Harness's default persona and Pi's current and earlier preambles.
+	{Match: "powered by DeepSeek Harness", Replacement: "powered by Antigravity"},
+	{Match: "inside pi, a coding agent harness", Replacement: "inside Antigravity, a coding agent harness"},
+})
 
 type filterMode string
 
@@ -390,13 +404,34 @@ const (
 	filterModeRewrite filterMode = "rewrite"
 )
 
+type rewriteBlock string
+
+const (
+	rewriteSystem      rewriteBlock = "system"
+	rewriteUser        rewriteBlock = "user"
+	rewriteAssistant   rewriteBlock = "assistant"
+	rewriteToolResults rewriteBlock = "tool_results"
+)
+
+var rewriteBlocks = []rewriteBlock{rewriteSystem, rewriteUser, rewriteAssistant, rewriteToolResults}
+
+func rewriteBlockNames() []string {
+	names := make([]string, 0, len(rewriteBlocks))
+	for _, block := range rewriteBlocks {
+		names = append(names, string(block))
+	}
+	return names
+}
+
 type rewriteMapping struct {
 	Match       string
 	Replacement string
+	pattern     *regexp.Regexp
 }
 
 type filterConfig struct {
 	Mode               filterMode
+	RewriteScope       []rewriteBlock
 	UseDefaultKeywords bool
 	CustomMappings     []rewriteMapping
 }
@@ -416,6 +451,7 @@ func applyFilterConfig(cfg filterConfig) {
 
 	currentFilterConfig = filterConfig{
 		Mode:               cfg.Mode,
+		RewriteScope:       slices.Clone(cfg.RewriteScope),
 		UseDefaultKeywords: cfg.UseDefaultKeywords,
 		CustomMappings:     append([]rewriteMapping(nil), normalizeMappings(cfg.CustomMappings)...),
 	}
@@ -427,6 +463,7 @@ func activeFilterConfig() filterConfig {
 
 	return filterConfig{
 		Mode:               currentFilterConfig.Mode,
+		RewriteScope:       slices.Clone(currentFilterConfig.RewriteScope),
 		UseDefaultKeywords: currentFilterConfig.UseDefaultKeywords,
 		CustomMappings:     append([]rewriteMapping(nil), currentFilterConfig.CustomMappings...),
 	}
@@ -464,6 +501,13 @@ func parseFilterConfigYAML(raw []byte) (filterConfig, error) {
 			return filterConfig{}, fmt.Errorf("mode must be one of: block, rewrite")
 		}
 	}
+	if value, exists := values["rewrite_scope"]; exists {
+		scope, err := parseRewriteScope(value)
+		if err != nil {
+			return filterConfig{}, err
+		}
+		cfg.RewriteScope = scope
+	}
 	if value, exists := values["use_default_keywords"]; exists {
 		boolValue, ok := value.(bool)
 		if !ok {
@@ -479,6 +523,28 @@ func parseFilterConfigYAML(raw []byte) (filterConfig, error) {
 		cfg.CustomMappings = mappings
 	}
 	return cfg, nil
+}
+
+func parseRewriteScope(value any) ([]rewriteBlock, error) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("rewrite_scope must be an array")
+	}
+	scope := make([]rewriteBlock, 0, len(items))
+	for _, item := range items {
+		name, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("rewrite_scope entries must be strings")
+		}
+		block := rewriteBlock(strings.ToLower(strings.TrimSpace(name)))
+		if !slices.Contains(rewriteBlocks, block) {
+			return nil, fmt.Errorf("unknown rewrite_scope entry %q, choose from %s", name, strings.Join(rewriteBlockNames(), ", "))
+		}
+		if !slices.Contains(scope, block) {
+			scope = append(scope, block)
+		}
+	}
+	return scope, nil
 }
 
 func parseCustomMappings(value any) ([]rewriteMapping, error) {
@@ -535,10 +601,16 @@ func parseMappingString(value string) ([]rewriteMapping, error) {
 	return mappings, nil
 }
 
-func effectiveMappings(cfg filterConfig) []rewriteMapping {
-	mappings := make([]rewriteMapping, 0, len(defaultRewriteMappings)+len(cfg.CustomMappings))
-	if cfg.UseDefaultKeywords {
-		mappings = append(mappings, defaultRewriteMappings...)
+func effectiveMappings(cfg filterConfig, block rewriteBlock) []rewriteMapping {
+	if !cfg.UseDefaultKeywords {
+		return normalizeMappings(cfg.CustomMappings)
+	}
+	if len(cfg.CustomMappings) == 0 && block != rewriteSystem {
+		return defaultRewriteMappings
+	}
+	mappings := slices.Clone(defaultRewriteMappings)
+	if block == rewriteSystem {
+		mappings = append(mappings, defaultSystemPromptMappings...)
 	}
 	mappings = append(mappings, cfg.CustomMappings...)
 	return normalizeMappings(mappings)
@@ -548,16 +620,23 @@ func normalizeMappings(mappings []rewriteMapping) []rewriteMapping {
 	seen := make(map[string]struct{}, len(mappings))
 	reversed := make([]rewriteMapping, 0, len(mappings))
 	for i := len(mappings) - 1; i >= 0; i-- {
-		match := strings.ToLower(strings.TrimSpace(mappings[i].Match))
-		replacement := strings.TrimSpace(mappings[i].Replacement)
+		mapping := mappings[i]
+		match := strings.TrimSpace(mapping.Match)
+		replacement := strings.TrimSpace(mapping.Replacement)
 		if match == "" || replacement == "" {
 			continue
 		}
-		if _, exists := seen[match]; exists {
+		key := strings.ToLower(match)
+		if _, exists := seen[key]; exists {
 			continue
 		}
-		seen[match] = struct{}{}
-		reversed = append(reversed, rewriteMapping{Match: match, Replacement: replacement})
+		seen[key] = struct{}{}
+		mapping.Match = key
+		mapping.Replacement = replacement
+		if mapping.pattern == nil {
+			mapping.pattern = literalMatchPattern(match)
+		}
+		reversed = append(reversed, mapping)
 	}
 	out := make([]rewriteMapping, 0, len(reversed))
 	for i := len(reversed) - 1; i >= 0; i-- {
@@ -588,17 +667,18 @@ func classifyRequestWithConfig(body []byte, cfg filterConfig) filterDecision {
 		return filterDecision{}
 	}
 
-	mappings := effectiveMappings(cfg)
+	mappings := effectiveMappings(cfg, rewriteSystem)
 	var decision filterDecision
-	transformEligiblePromptFields(root, func(text string) (string, bool) {
+	transform := func(text string) (string, bool) {
 		if decision.Blocked {
 			return text, false
 		}
-		if mapping, protected := findEligibleMapping(text, mappings); protected {
+		if mapping, found := findEligibleMapping(text, mappings); found {
 			decision = filterDecision{Blocked: true, Signal: "system.keyword", Detail: mapping.Match}
 		}
 		return text, false
-	})
+	}
+	transformPromptObject(root, map[rewriteBlock]promptTransform{rewriteSystem: transform})
 	return decision
 }
 
@@ -608,17 +688,28 @@ func rewriteRequestBody(body []byte) ([]byte, bool) {
 
 func rewriteRequestBodyWithConfig(body []byte, cfg filterConfig) ([]byte, bool) {
 	var root any
-	if err := json.Unmarshal(body, &root); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&root); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return nil, false
 	}
-	mappings := effectiveMappings(cfg)
-	rewritten, changed := transformEligiblePromptFields(root, func(text string) (string, bool) {
-		return rewritePromptText(text, mappings)
-	})
-	if !changed {
+	scope := cfg.RewriteScope
+	if scope == nil {
+		scope = []rewriteBlock{rewriteSystem}
+	}
+	transforms := make(map[rewriteBlock]promptTransform, len(scope))
+	for _, block := range scope {
+		mappings := effectiveMappings(cfg, block)
+		if len(mappings) > 0 {
+			transforms[block] = func(text string) (string, bool) {
+				return rewritePromptText(text, mappings)
+			}
+		}
+	}
+	if len(transforms) == 0 || !transformPromptObject(root, transforms) {
 		return nil, false
 	}
-	raw, err := json.Marshal(rewritten)
+	raw, err := json.Marshal(root)
 	if err != nil {
 		return nil, false
 	}
@@ -690,37 +781,23 @@ func rewriteSystemValue(value any, mappings []rewriteMapping) (any, bool) {
 	}
 }
 
-// transformEligiblePromptFields visits only protocol-defined system/developer
-// prompt text. It intentionally does not recurse through arbitrary JSON: user
-// messages, tool payloads, identifiers, and metadata must remain untouched.
-func transformEligiblePromptFields(root any, transform func(string) (string, bool)) (any, bool) {
-	return transformPromptObject(root, true, transform)
-}
+type promptTransform func(string) (string, bool)
 
-func transformPromptObject(value any, allowPromptFields bool, transform func(string) (string, bool)) (any, bool) {
+// The traversal follows protocol-defined text fields and the Antigravity
+// request wrapper, preserving structural fields such as tool-call identifiers.
+func transformPromptObject(value any, transforms map[rewriteBlock]promptTransform) bool {
 	object, ok := value.(map[string]any)
 	if !ok {
-		return value, false
+		return false
 	}
 	changed := false
-	if allowPromptFields {
+	if transform := transforms[rewriteSystem]; transform != nil {
 		for _, key := range []string{"system", "instructions"} {
 			child, exists := object[key]
 			if !exists {
 				continue
 			}
 			next, childChanged := transformPromptTextContainer(child, transform)
-			if childChanged {
-				object[key] = next
-				changed = true
-			}
-		}
-		for _, key := range []string{"input", "messages"} {
-			child, exists := object[key]
-			if !exists {
-				continue
-			}
-			next, childChanged := transformRoleMessages(child, transform)
 			if childChanged {
 				object[key] = next
 				changed = true
@@ -739,16 +816,21 @@ func transformPromptObject(value any, allowPromptFields bool, transform func(str
 		}
 	}
 
-	// CPA may wrap the original request in an Antigravity `request` object.
-	// Re-enter only that protocol wrapper instead of scanning every nested map.
-	if child, exists := object["request"]; exists {
-		next, childChanged := transformPromptObject(child, true, transform)
-		if childChanged {
-			object["request"] = next
+	if transformTextField(object, "input", transforms[rewriteUser]) {
+		changed = true
+	}
+	for _, field := range []string{"input", "messages"} {
+		if transformRoleMessages(object[field], transforms) {
 			changed = true
 		}
 	}
-	return object, changed
+	if transformGeminiMessages(object["contents"], transforms) {
+		changed = true
+	}
+	if transformPromptObject(object["request"], transforms) {
+		changed = true
+	}
+	return changed
 }
 
 func transformPromptTextContainer(value any, transform func(string) (string, bool)) (any, bool) {
@@ -778,92 +860,172 @@ func transformPromptTextContainer(value any, transform func(string) (string, boo
 	return value, false
 }
 
-func transformRoleMessages(value any, transform func(string) (string, bool)) (any, bool) {
+func transformRoleMessages(value any, transforms map[rewriteBlock]promptTransform) bool {
 	switch typed := value.(type) {
 	case []any:
 		changed := false
-		for index, child := range typed {
-			next, childChanged := transformRoleMessage(child, transform)
-			if childChanged {
-				typed[index] = next
+		for _, child := range typed {
+			if transformRoleMessage(child, transforms) {
 				changed = true
 			}
 		}
-		return typed, changed
+		return changed
 	case map[string]any:
-		return transformRoleMessage(typed, transform)
+		return transformRoleMessage(typed, transforms)
 	default:
-		return value, false
+		return false
 	}
 }
 
-func transformRoleMessage(value any, transform func(string) (string, bool)) (any, bool) {
+func transformRoleMessage(value any, transforms map[rewriteBlock]promptTransform) bool {
 	message, ok := value.(map[string]any)
 	if !ok {
-		return value, false
+		return false
 	}
-	role, _ := message["role"].(string)
-	role = strings.ToLower(strings.TrimSpace(role))
-	if role != "system" && role != "developer" {
-		return value, false
+	if itemType := normalizedJSONField(message, "type"); itemType == "function_call_output" || itemType == "custom_tool_call_output" {
+		return transformContentField(message, "output", transforms[rewriteToolResults], false)
 	}
-	content, exists := message["content"]
-	if !exists {
-		return value, false
+	switch normalizedJSONField(message, "role") {
+	case "system", "developer":
+		return transformContentField(message, "content", transforms[rewriteSystem], false)
+	case "assistant":
+		return transformContentField(message, "content", transforms[rewriteAssistant], true)
+	case "tool", "function":
+		return transformContentField(message, "content", transforms[rewriteToolResults], false)
+	case "user":
+		changed := transformContentField(message, "content", transforms[rewriteUser], false)
+		if transform := transforms[rewriteToolResults]; transform != nil {
+			blocks, _ := message["content"].([]any)
+			for _, child := range blocks {
+				block, _ := child.(map[string]any)
+				if normalizedJSONField(block, "type") == "tool_result" && transformContentField(block, "content", transform, false) {
+					changed = true
+				}
+			}
+		}
+		return changed
+	default:
+		return false
 	}
-	next, changed := transformMessageContent(content, transform)
-	if changed {
-		message["content"] = next
-	}
-	return message, changed
 }
 
-func transformMessageContent(value any, transform func(string) (string, bool)) (any, bool) {
+func transformContentField(object map[string]any, field string, transform promptTransform, allowOutputText bool) bool {
+	if transform == nil {
+		return false
+	}
+	next, changed := transformMessageContent(object[field], transform, allowOutputText)
+	if changed {
+		object[field] = next
+	}
+	return changed
+}
+
+func transformMessageContent(value any, transform promptTransform, allowOutputText bool) (any, bool) {
 	switch typed := value.(type) {
 	case string:
 		return transform(typed)
 	case []any:
 		changed := false
-		for index, child := range typed {
-			block, ok := child.(map[string]any)
-			if !ok {
-				continue
-			}
-			blockType, _ := block["type"].(string)
-			blockType = strings.ToLower(strings.TrimSpace(blockType))
-			if blockType != "text" && blockType != "input_text" {
-				continue
-			}
-			text, ok := block["text"].(string)
-			if !ok {
-				continue
-			}
-			next, childChanged := transform(text)
-			if childChanged {
-				block["text"] = next
-				typed[index] = block
+		for _, child := range typed {
+			block, _ := child.(map[string]any)
+			if transformMessageTextBlock(block, transform, allowOutputText) {
 				changed = true
 			}
 		}
 		return typed, changed
 	case map[string]any:
-		blockType, _ := typed["type"].(string)
-		blockType = strings.ToLower(strings.TrimSpace(blockType))
-		if blockType != "text" && blockType != "input_text" {
-			return value, false
-		}
-		text, ok := typed["text"].(string)
-		if !ok {
-			return value, false
-		}
-		next, changed := transform(text)
-		if changed {
-			typed["text"] = next
-		}
-		return typed, changed
+		return typed, transformMessageTextBlock(typed, transform, allowOutputText)
 	default:
 		return value, false
 	}
+}
+
+func normalizedJSONField(object map[string]any, field string) string {
+	value, _ := object[field].(string)
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func transformTextField(object map[string]any, field string, transform promptTransform) bool {
+	text, ok := object[field].(string)
+	if !ok || transform == nil {
+		return false
+	}
+	next, changed := transform(text)
+	if changed {
+		object[field] = next
+	}
+	return changed
+}
+
+func transformMessageTextBlock(block map[string]any, transform promptTransform, allowOutputText bool) bool {
+	switch normalizedJSONField(block, "type") {
+	case "text", "input_text":
+		return transformTextField(block, "text", transform)
+	case "output_text":
+		return allowOutputText && transformTextField(block, "text", transform)
+	default:
+		return false
+	}
+}
+
+func transformGeminiMessages(value any, transforms map[rewriteBlock]promptTransform) bool {
+	userTransform := transforms[rewriteUser]
+	assistantTransform := transforms[rewriteAssistant]
+	toolTransform := transforms[rewriteToolResults]
+	if userTransform == nil && assistantTransform == nil && toolTransform == nil {
+		return false
+	}
+	messages, _ := value.([]any)
+	changed := false
+	for _, child := range messages {
+		message, _ := child.(map[string]any)
+		parts, _ := message["parts"].([]any)
+		var transform promptTransform
+		switch normalizedJSONField(message, "role") {
+		case "", "user":
+			transform = userTransform
+		case "assistant", "model":
+			transform = assistantTransform
+		case "tool", "function":
+			transform = toolTransform
+		}
+		for _, child := range parts {
+			part, _ := child.(map[string]any)
+			if thought, _ := part["thought"].(bool); !thought && transformTextField(part, "text", transform) {
+				changed = true
+			}
+			if toolTransform != nil {
+				for _, field := range []string{"functionResponse", "function_response"} {
+					response, _ := part[field].(map[string]any)
+					if transformGeminiFunctionResponse(response, toolTransform) {
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	return changed
+}
+
+func transformGeminiFunctionResponse(response map[string]any, transform promptTransform) bool {
+	if transformTextField(response, "response", transform) {
+		return true
+	}
+	result, _ := response["response"].(map[string]any)
+	changed := false
+	for _, field := range []string{"result", "output", "error", "text"} {
+		if transformContentField(result, field, transform, false) {
+			changed = true
+		}
+	}
+	parts, _ := response["parts"].([]any)
+	for _, child := range parts {
+		part, _ := child.(map[string]any)
+		if transformTextField(part, "text", transform) {
+			changed = true
+		}
+	}
+	return changed
 }
 
 func transformGeminiSystemInstruction(value any, transform func(string) (string, bool)) (any, bool) {
@@ -897,7 +1059,7 @@ func transformGeminiSystemInstruction(value any, transform func(string) (string,
 
 func findEligibleMapping(text string, mappings []rewriteMapping) (rewriteMapping, bool) {
 	for _, mapping := range mappings {
-		if containsUnprotected(text, mapping.Match) {
+		if len(unprotectedMatches(text, mapping.matchPattern())) > 0 {
 			return mapping, true
 		}
 	}
@@ -909,63 +1071,60 @@ func rewritePromptText(value string, mappings []rewriteMapping) (string, bool) {
 	changed := false
 	for _, mapping := range mappings {
 		var replaced bool
-		next, replaced = replaceInsensitiveProtected(next, mapping.Match, mapping.Replacement)
+		next, replaced = replaceMatchedText(next, mapping.matchPattern(), mapping.Replacement)
 		changed = changed || replaced
 	}
 	return next, changed
 }
 
+func (mapping rewriteMapping) matchPattern() *regexp.Regexp {
+	if mapping.pattern != nil {
+		return mapping.pattern
+	}
+	return literalMatchPattern(mapping.Match)
+}
+
 func containsUnprotected(value, match string) bool {
-	lowerValue := strings.ToLower(value)
-	lowerMatch := strings.ToLower(match)
-	if lowerMatch == "" {
-		return false
-	}
-	protected := protectedTextRanges(value)
-	for start := 0; ; {
-		index := strings.Index(lowerValue[start:], lowerMatch)
-		if index < 0 {
-			return false
-		}
-		index += start
-		if !overlapsProtected(index, index+len(match), protected) {
-			return true
-		}
-		start = index + len(match)
-		if start > len(value) {
-			return false
-		}
-	}
+	return len(unprotectedMatches(value, literalMatchPattern(match))) > 0
 }
 
 func replaceInsensitiveProtected(value, match, replacement string) (string, bool) {
+	return replaceMatchedText(value, literalMatchPattern(match), replacement)
+}
+
+func literalMatchPattern(match string) *regexp.Regexp {
 	if match == "" {
+		return nil
+	}
+	pattern, _ := regexp.Compile("(?i)" + regexp.QuoteMeta(match))
+	return pattern
+}
+
+func unprotectedMatches(value string, pattern *regexp.Regexp) [][]int {
+	if pattern == nil {
+		return nil
+	}
+	indices := pattern.FindAllStringIndex(value, -1)
+	if len(indices) == 0 {
+		return nil
+	}
+	protected := protectedTextRanges(value)
+	return slices.DeleteFunc(indices, func(index []int) bool {
+		return overlapsProtected(index[0], index[1], protected)
+	})
+}
+
+func replaceMatchedText(value string, pattern *regexp.Regexp, replacement string) (string, bool) {
+	matches := unprotectedMatches(value, pattern)
+	if len(matches) == 0 {
 		return value, false
 	}
-	lowerValue := strings.ToLower(value)
-	lowerMatch := strings.ToLower(match)
-	protected := protectedTextRanges(value)
 	var builder strings.Builder
 	start := 0
-	changed := false
-	for {
-		index := strings.Index(lowerValue[start:], lowerMatch)
-		if index < 0 {
-			break
-		}
-		index += start
-		builder.WriteString(value[start:index])
-		end := index + len(match)
-		if overlapsProtected(index, end, protected) {
-			builder.WriteString(value[index:end])
-		} else {
-			builder.WriteString(replacement)
-			changed = true
-		}
-		start = end
-	}
-	if !changed {
-		return value, false
+	for _, match := range matches {
+		builder.WriteString(value[start:match[0]])
+		builder.WriteString(replacement)
+		start = match[1]
 	}
 	builder.WriteString(value[start:])
 	return builder.String(), true

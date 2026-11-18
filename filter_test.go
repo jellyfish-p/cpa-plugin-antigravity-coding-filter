@@ -115,6 +115,10 @@ func TestRewriteRequestAllowsCleanInvalidAndStructuralBodies(t *testing.T) {
 			body: `{`,
 		},
 		{
+			name: "multiple JSON values",
+			body: `{"system":"You are Codex."} {}`,
+		},
+		{
 			name: "empty body",
 			body: ``,
 		},
@@ -201,6 +205,166 @@ func TestRewriteRequestIgnoresIneligibleProtocolText(t *testing.T) {
 	}
 }
 
+func TestRewriteScopeSelectsTextBlocksIndependently(t *testing.T) {
+	const request = `{
+		"instructions":"system Sample product", "input":"user Sample product",
+		"messages":[
+			{"role":"developer","content":"system Sample product"},
+			{"role":"user","content":[{"type":"text","text":"user Sample product"}]},
+			{"role":"assistant","content":[{"type":"output_text","text":"assistant Sample product"}],"tool_calls":[{"id":"Sample product","function":{"name":"Sample product","arguments":"Sample product"}}]},
+			{"role":"tool","tool_call_id":"Sample product","content":"tool_results Sample product"}
+		],
+		"tools":[{"type":"function","function":{"description":"Sample product"}}],
+		"metadata":{"tag":"Sample product","n":9007199254740993}
+	}`
+	tests := []struct {
+		name   string
+		config string
+		blocks []string
+	}{
+		{"omitted", "", []string{"system"}},
+		{"empty", "rewrite_scope: []", nil},
+		{"user and assistant", "rewrite_scope: [' User ', assistant, user]", []string{"user", "assistant"}},
+		{"all", "rewrite_scope: [system, user, assistant, tool_results]", []string{"system", "user", "assistant", "tool_results"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := parseFilterConfigYAML([]byte("mode: rewrite\n" + tt.config + "\ncustom_mappings: {Sample product: replacement}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, rewritten := rewriteRequestBodyWithConfig([]byte(request), cfg)
+			if rewritten != (len(tt.blocks) > 0) {
+				t.Fatalf("rewritten = %v for config %q", rewritten, tt.config)
+			}
+			if !rewritten {
+				return
+			}
+			want := request
+			for _, block := range tt.blocks {
+				want = strings.ReplaceAll(want, block+" Sample product", block+" replacement")
+			}
+			assertRequestJSON(t, got, want)
+			if !strings.Contains(string(got), `"n":9007199254740993`) {
+				t.Fatalf("large number changed in %s", got)
+			}
+		})
+	}
+}
+
+func TestRewriteScopeCoversProtocolToolResultText(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "Anthropic mixed user blocks and tool results",
+			body: `{"messages":[{"role":"user","content":[{"type":"text","text":"user Codex"},{"type":"tool_result","tool_use_id":"Codex","content":[{"type":"text","text":"result Codex"},{"type":"image","source":{"data":"Codex"}}]},{"type":"tool_result","tool_use_id":"Codex","content":"result Codex"}]}]}`,
+		},
+		{
+			name: "Responses function outputs",
+			body: `{"input":[{"type":"function_call","call_id":"Codex","name":"Codex","arguments":"Codex"},{"type":"function_call_output","call_id":"Codex","output":"result Codex"},{"type":"custom_tool_call_output","call_id":"Codex","output":[{"type":"input_text","text":"result Codex"}]}]}`,
+		},
+		{
+			name: "wrapped Gemini function responses",
+			body: `{"request":{"contents":[{"role":"user","parts":[{"text":"user Codex"},{"functionResponse":{"name":"Codex","id":"Codex","response":{"result":"result Codex","structured":{"tag":"Codex"}},"parts":[{"text":"result Codex"},{"inlineData":{"data":"Codex"}}]}}]},{"role":"function","parts":[{"function_response":{"name":"Codex","id":"Codex","response":{"output":[{"type":"text","text":"result Codex"}]}}},{"text":"result Codex"}]},{"role":"model","parts":[{"functionCall":{"name":"Codex","args":{"query":"Codex"}}}]}]}}`,
+		},
+	}
+	cfg := defaultFilterConfig()
+	cfg.RewriteScope = []rewriteBlock{rewriteToolResults}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, rewritten := rewriteRequestBodyWithConfig([]byte(tt.body), cfg)
+			if !rewritten {
+				t.Fatal("tool result text was not rewritten")
+			}
+			assertRequestJSON(t, got, strings.ReplaceAll(tt.body, "result Codex", "result Antigravity"))
+			if classifyRequestWithConfig([]byte(tt.body), cfg).Blocked {
+				t.Fatal("rewrite scope affected block mode")
+			}
+		})
+	}
+}
+
+func TestRewriteScopeCoversGeminiMessageText(t *testing.T) {
+	const body = `{"request":{"contents":[{"role":"user","parts":[{"text":"Codex user"},{"functionResponse":{"response":{"result":"Codex result"}}}]},{"parts":[{"text":"Codex user"}]},{"role":"model","parts":[{"text":"Codex model"},{"thought":true,"text":"Codex thought"}]}]}}`
+	cfg := defaultFilterConfig()
+	cfg.RewriteScope = []rewriteBlock{rewriteUser, rewriteAssistant}
+	got, rewritten := rewriteRequestBodyWithConfig([]byte(body), cfg)
+	if !rewritten {
+		t.Fatal("Gemini user and model text was not rewritten")
+	}
+	want := strings.NewReplacer("Codex user", "Antigravity user", "Codex model", "Antigravity model").Replace(body)
+	assertRequestJSON(t, got, want)
+}
+
+func TestRewriteScopePreservesUnicodeBeforeMatches(t *testing.T) {
+	cfg := defaultFilterConfig()
+	cfg.RewriteScope = []rewriteBlock{rewriteUser}
+	body := []byte(`{"input":"Kelvin mentioned Codex near https://example.test/Codex."}`)
+	got, rewritten := rewriteRequestBodyWithConfig(body, cfg)
+	if !rewritten {
+		t.Fatal("user message text was not rewritten")
+	}
+	assertRequestJSON(t, got, `{"input":"Kelvin mentioned Antigravity near https://example.test/Codex."}`)
+}
+
+func TestSystemPromptPresetsDetectDeepSeekHarnessAndPi(t *testing.T) {
+	tests := []struct {
+		prompt string
+		want   string
+	}{
+		{"You are an AI agent powered by DeepSeek Harness.", "You are an AI agent powered by Antigravity."},
+		{"You are an expert coding assistant operating inside pi, a coding agent harness.", "You are an expert coding assistant operating inside Antigravity, a coding agent harness."},
+		{"You are a coding assistant running inside PI, a coding agent harness.", "You are a coding assistant running inside Antigravity, a coding agent harness."},
+	}
+	cfg := defaultFilterConfig()
+	cfg.RewriteScope = []rewriteBlock{rewriteSystem, rewriteUser}
+	for _, tt := range tests {
+		t.Run(tt.prompt, func(t *testing.T) {
+			body := `{"system":"` + tt.prompt + `","input":"` + tt.prompt + `"}`
+			if decision := classifyRequestWithConfig([]byte(body), cfg); !decision.Blocked {
+				t.Fatalf("system prompt was not detected: %s", body)
+			}
+			got, rewritten := rewriteRequestBodyWithConfig([]byte(body), cfg)
+			if !rewritten {
+				t.Fatalf("system prompt was not rewritten: %s", body)
+			}
+			assertRequestJSON(t, got, `{"system":"`+tt.want+`","input":"`+tt.prompt+`"}`)
+		})
+	}
+	for _, body := range []string{`{"system":"Describe pi, dsh, and DeepSeek Harness."}`, `{"input":"You are an AI agent powered by DeepSeek Harness."}`} {
+		if decision := classifyRequestWithConfig([]byte(body), cfg); decision.Blocked {
+			t.Fatalf("unexpected preset match in %s", body)
+		}
+		if got, rewritten := rewriteRequestBodyWithConfig([]byte(body), cfg); rewritten {
+			t.Fatalf("unexpected rewrite = %s", got)
+		}
+	}
+	cfg.UseDefaultKeywords = false
+	body := []byte(`{"system":"You are an AI agent powered by DeepSeek Harness."}`)
+	if decision := classifyRequestWithConfig(body, cfg); decision.Blocked {
+		t.Fatal("preset match with built-in keywords disabled")
+	}
+	if got, rewritten := rewriteRequestBodyWithConfig(body, cfg); rewritten {
+		t.Fatalf("preset rewrite = %s with built-in keywords disabled", got)
+	}
+}
+
+func assertRequestJSON(t *testing.T, got []byte, want string) {
+	t.Helper()
+	var gotValue, wantValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("decode rewritten body: %v", err)
+	}
+	if err := json.Unmarshal([]byte(want), &wantValue); err != nil {
+		t.Fatalf("decode expected body: %v", err)
+	}
+	if !reflect.DeepEqual(gotValue, wantValue) {
+		t.Fatalf("body = %s, want %s", got, want)
+	}
+}
+
 func TestRewriteRequestPreservesTechnicalReferencesAndRewritesEmphasizedNames(t *testing.T) {
 	body := []byte(`{"system":"mcp__playwright__move-cursor mcp\\_\\_playwright\\_\\_move-cursor CODEX.md __CODEX.md__. .codex/config https://example.test/Codex C:\\work\\Codex \\\\server\\share\\Codex /workspace/Codex docs\\Codex **Codex** __Codex__ \\*\\*Codex\\*\\* Continue.dev Refact.ai SWE-agent"}`)
 	got, rewritten := rewriteRequestBody(body)
@@ -227,6 +391,7 @@ func TestClassifyRequestUsesSameEligiblePromptFieldsAsRewrite(t *testing.T) {
 		want bool
 	}{
 		{name: "responses developer", body: `{"input":[{"role":"developer","content":[{"type":"input_text","text":"Codex"}]}]}`, want: true},
+		{name: "assistant block type under developer role", body: `{"input":[{"role":"developer","content":[{"type":"output_text","text":"Codex"}]}]}`, want: false},
 		{name: "chat user", body: `{"messages":[{"role":"user","content":"Codex"}]}`, want: false},
 		{name: "gemini system", body: `{"systemInstruction":{"parts":[{"text":"Codex"}]}}`, want: true},
 		{name: "technical file", body: `{"system":"CODEX.md"}`, want: false},

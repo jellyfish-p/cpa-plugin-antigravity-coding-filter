@@ -4,19 +4,19 @@ CLIProxyAPI v7 dynamic plugin for blocking or rewriting non-Antigravity coding s
 
 ## Filter Modes
 
-The plugin inspects only system/developer prompt text after CLIProxyAPI has selected the upstream format. Choose how matches are handled with `mode`:
+The plugin inspects requests after CLIProxyAPI has selected the upstream format. The `mode` setting controls how the plugin handles matches.
 
 - `block` (default): reject the entire request with HTTP `403 Forbidden` and a `blocked_by_antigravity_coding_filter` error.
-- `rewrite`: replace matched names with `Antigravity` and forward the request.
+- `rewrite`: replace matched names in the selected text blocks and forward the request. The default scope is system/developer prompts.
 
-Matching is case-insensitive. The eligible locations are:
+Matching is case-insensitive. Both modes support these system/developer prompt locations.
 
 - Anthropic `system` text and text blocks.
 - OpenAI Responses `instructions`, plus `input` messages whose role is `system` or `developer`, including `input_text` blocks.
 - OpenAI Chat Completions `messages` whose role is `system` or `developer`, including string and `text` block content.
 - Gemini `systemInstruction.parts[].text` and `system_instruction.parts[].text`, including the Antigravity `request` wrapper.
 
-User and assistant messages, tool definitions/results, image data, metadata, and other JSON fields are preserved. Technical references such as URLs, paths, `CODEX.md`, `.codex`, and `mcp__...` identifiers are preserved even when they occur inside an eligible prompt. Markdown emphasis around a name does not prevent a configured name from being rewritten.
+Technical references such as URLs, paths, `CODEX.md`, `.codex`, and `mcp__...` identifiers are preserved within eligible text. Markdown emphasis around a configured name still allows a match.
 
 The before-auth interceptor and model router are pass-through hooks. The filter runs in `request.intercept_after` only when CLIProxyAPI reports `ToFormat: "antigravity"`; other upstream providers are untouched.
 
@@ -35,10 +35,26 @@ The built-in preset is enabled by default and covers major AI coding editors, as
 - Zed AI, Void Editor, PearAI, Refact.ai, Tabby, GitLab Duo, Visual Studio IntelliCode
 - CodeBuddy, Blackbox AI, Pieces for Developers, Qodo / CodiumAI, Rovo Dev CLI, Factory Droid
 - OpenClaw (including Clawdbot and Moltbot), Hermes Agent, WorkBuddy
+- DeepSeek Harness (`dsh`) and Pi coding agent, using identity phrases from their default system prompts. [DeepSeek Harness prompt snapshot](https://github.com/deepseek-ai/deepseek-harness/blob/2e39e70496aa02986ca6a820c5d497e816b69d7e/snapshots/sdk/text-turn/system-prompt.expected.md), [Pi prompt builder](https://github.com/earendil-works/pi/blob/63dec2621d3cb2e1f4d7cefd6df061e78c6de979/packages/coding-agent/src/core/system-prompt.ts)
+
+## Rewrite Scope
+
+Set `rewrite_scope` to a list of any combination of these options. Omit it for `[system]` or use `[]` to disable rewriting. Block mode always checks system/developer prompts.
+
+| Option | Text selected |
+| --- | --- |
+| `system` | System and developer prompts |
+| `user` | User message text and OpenAI Responses string `input` |
+| `assistant` | Assistant or Gemini `model` message text |
+| `tool_results` | Tool and function message text, Anthropic `tool_result` content, OpenAI Responses output items, and Gemini function result text |
+
+Text carried in a plain Gemini user part is covered by `user`. The `tool_results` option covers text in explicitly structured function responses or tool messages. A tool result delivered as a string is processed as text, including a string containing serialized JSON. Tool definitions, protocol-level call identifiers, function names and arguments, images, metadata, and structured result fields outside the supported text locations are preserved.
+
+The CLIProxyAPI Management Center edits array settings as JSON. Enter a list such as `["system", "user", "tool_results"]` in the `rewrite_scope` field, or set the same options in YAML.
 
 ## Mapping Configuration
 
-You can select rewrite mode, disable the built-in preset, and provide your own mapping relationships in the plugin config:
+The plugin config can select rewrite mode and its scope, disable the built-in preset, and provide custom mappings.
 
 ```yaml
 plugins:
@@ -47,6 +63,7 @@ plugins:
       enabled: true
       priority: 1
       mode: rewrite
+      rewrite_scope: [system, user, tool_results]
       use_default_keywords: false
       custom_mappings:
         Cursor: Antigravity

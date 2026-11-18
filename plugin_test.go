@@ -40,6 +40,18 @@ func TestHandlePluginCallRegisterDeclaresBothFilterModes(t *testing.T) {
 	if !hasConfigField(fields, "use_default_keywords", "boolean") {
 		t.Fatalf("ConfigFields = %#v, want boolean use_default_keywords", fields)
 	}
+	if !hasConfigField(fields, "rewrite_scope", "array") {
+		t.Fatalf("ConfigFields = %#v, want array rewrite_scope", fields)
+	}
+	for _, value := range fields {
+		field := value.(map[string]any)
+		if field["Name"] == "rewrite_scope" {
+			description, _ := field["Description"].(string)
+			if !strings.Contains(description, "system, user, assistant, tool_results") || !strings.Contains(description, `Defaults to ["system"]`) {
+				t.Fatalf("rewrite_scope description = %q, want selectable options and default", description)
+			}
+		}
+	}
 	if !hasConfigField(fields, "custom_mappings", "object") {
 		t.Fatalf("ConfigFields = %#v, want object custom_mappings", fields)
 	}
@@ -139,6 +151,48 @@ custom_mappings:
 	}
 	if got, rewritten := rewriteRequestBody([]byte(`{"system":"You are Codex."}`)); rewritten {
 		t.Fatalf("Codex rewritten after invalid config, want previous disabled-default state retained; body=%s", got)
+	}
+}
+
+func TestHandlePluginCallReconfigureSelectsRewriteScope(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	for _, tt := range []struct {
+		config string
+		valid  bool
+	}{
+		{config: "mode: rewrite\nrewrite_scope: [user, tool_results]", valid: true},
+		{config: "mode: rewrite\nrewrite_scope: [invalid]"},
+		{config: "mode: rewrite\nrewrite_scope: [true]"},
+		{config: "mode: rewrite\nrewrite_scope: system"},
+	} {
+		t.Run(tt.config, func(t *testing.T) {
+			var lifecycle struct {
+				OK    bool `json:"ok"`
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			raw, code := handlePluginCall("plugin.reconfigure", lifecycleRequestJSON(t, []byte(tt.config)))
+			mustUnmarshalJSON(t, raw, &lifecycle)
+			if code != 0 || lifecycle.OK != tt.valid || (!tt.valid && lifecycle.Error.Code != "invalid_config") {
+				t.Fatalf("unexpected reconfigure response, code = %d, body = %s", code, raw)
+			}
+
+			const body = `{"system":"Codex","messages":[{"role":"user","content":"Codex"},{"role":"assistant","content":"Codex"},{"role":"tool","content":"Codex"}]}`
+			var intercepted struct {
+				OK     bool `json:"ok"`
+				Result struct {
+					Body []byte `json:"Body"`
+				} `json:"result"`
+			}
+			raw, code = handlePluginCall("request.intercept_after", requestInterceptRequestJSONForFormat(t, "antigravity", body))
+			mustUnmarshalJSON(t, raw, &intercepted)
+			if code != 0 || !intercepted.OK {
+				t.Fatalf("unexpected interceptor response, code = %d, body = %s", code, raw)
+			}
+			const want = `{"system":"Codex","messages":[{"role":"user","content":"Antigravity"},{"role":"assistant","content":"Codex"},{"role":"tool","content":"Antigravity"}]}`
+			assertRequestJSON(t, intercepted.Result.Body, want)
+		})
 	}
 }
 
