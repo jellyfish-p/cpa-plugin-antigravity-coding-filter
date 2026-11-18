@@ -229,18 +229,25 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_freebsd_${{ matrix.goarch }}.zip" >> "${GITHUB_ENV}"
 
-      - name: Download Go for the FreeBSD VM
+      - name: Prepare inputs for the FreeBSD VM
         run: |
           set -euo pipefail
+          staging="dist/freebsd-${{ matrix.goarch }}"
           archive="$(go env GOVERSION).freebsd-${{ matrix.goarch }}.tar.gz"
-          destination="dist/freebsd-${{ matrix.goarch }}/go.tar.gz"
+          destination="${staging}/go.tar.gz"
           curl_options=(--fail --silent --show-error --location --connect-timeout 20
                         --max-time 180 --retry 3 --retry-max-time 240)
           checksum="$(curl "${curl_options[@]}" 'https://go.dev/dl/?mode=json&include=all' |
             jq -er --arg archive "${archive}" '.[] | .files[] | select(.filename == $archive) | .sha256')"
-          mkdir -p "$(dirname "${destination}")"
+          mkdir -p "${staging}"
           curl "${curl_options[@]}" "https://go.dev/dl/${archive}" --output "${destination}"
           printf '%s  %s\n' "${checksum}" "${destination}" | sha256sum --strict --check
+          module_cache="$(mktemp -d)"
+          GOMODCACHE="${module_cache}" go mod download
+          mv "${module_cache}/cache/download" "${staging}/module-proxy"
+          git archive --format=tar HEAD > "${staging}/source.tar"
+          source_checksum="$(sha256sum "${staging}/source.tar" | cut -d ' ' -f 1)"
+          echo "FREEBSD_SOURCE_SHA256=${source_checksum}" >> "${GITHUB_ENV}"
 
       - name: Test and build in the FreeBSD VM
         timeout-minutes: 45
@@ -249,27 +256,32 @@ jobs:
           release: '14.4'
           arch: x86_64
           sync: rsync
-          envs: PLUGIN_ID
-          prepare: pkg install -y git
+          envs: PLUGIN_ID FREEBSD_SOURCE_SHA256
           run: |
             set -eu
             toolchain="$(mktemp -d)"
-            output_dir="dist/freebsd-${{ matrix.goarch }}"
-            tar -xzf "${output_dir}/go.tar.gz" -C "${toolchain}"
+            source_dir="$(mktemp -d)"
+            staging="${PWD}/dist/freebsd-${{ matrix.goarch }}"
+            test "$(sha256 -q "${staging}/source.tar")" = "${FREEBSD_SOURCE_SHA256}"
+            tar -xf "${staging}/source.tar" -C "${source_dir}"
+            tar -xzf "${staging}/go.tar.gz" -C "${toolchain}"
             export PATH="${toolchain}/go/bin:${PATH}"
             export GOTOOLCHAIN=local CGO_ENABLED=1
+            export GOPROXY="file://${staging}/module-proxy"
+            cd "${source_dir}"
             test "$(go env GOOS)/$(go env GOARCH)" = 'freebsd/${{ matrix.goarch }}'
-            go test ./... ./.github/scripts
-            go build -buildvcs=true -trimpath -buildmode=c-shared \
+            go test -mod=readonly ./... ./.github/scripts
+            go build -mod=readonly -trimpath -buildmode=c-shared \
               -ldflags "-s -w" \
-              -o "${output_dir}/${PLUGIN_ID}.so" .
+              -o "${staging}/${PLUGIN_ID}.so" .
 
       - name: Package plugin
         run: |
           set -euo pipefail
           library="dist/freebsd-${{ matrix.goarch }}/${PLUGIN_ID}.so"
           metadata="$(go version -m "${library}")"
-          grep -F "vcs.revision=$(git rev-parse HEAD)" <<< "${metadata}"
+          grep -F 'GOOS=freebsd' <<< "${metadata}"
+          grep -F 'GOARCH=${{ matrix.goarch }}' <<< "${metadata}"
           go run ./.github/scripts/package-release.go \
             -library "${library}" \
             -archive "${ARCHIVE_NAME}" \
