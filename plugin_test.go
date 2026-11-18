@@ -40,15 +40,15 @@ func TestHandlePluginCallRegisterDeclaresBothFilterModes(t *testing.T) {
 	if !hasConfigField(fields, "use_default_keywords", "boolean") {
 		t.Fatalf("ConfigFields = %#v, want boolean use_default_keywords", fields)
 	}
-	if !hasConfigField(fields, "rewrite_scope", "array") {
-		t.Fatalf("ConfigFields = %#v, want array rewrite_scope", fields)
+	if !hasConfigField(fields, "scope", "array") || hasConfigField(fields, "rewrite_scope", "array") {
+		t.Fatalf("ConfigFields = %#v, want a single array scope", fields)
 	}
 	for _, value := range fields {
 		field := value.(map[string]any)
-		if field["Name"] == "rewrite_scope" {
+		if field["Name"] == "scope" {
 			description, _ := field["Description"].(string)
-			if !strings.Contains(description, "system, user, assistant, tool_results") || !strings.Contains(description, `Defaults to ["system"]`) {
-				t.Fatalf("rewrite_scope description = %q, want selectable options and default", description)
+			if !strings.Contains(description, "system, user, assistant, tool_results, tool_descriptions") || !strings.Contains(description, `Defaults to ["system"]`) {
+				t.Fatalf("scope description = %q, want selectable options and default", description)
 			}
 		}
 	}
@@ -154,16 +154,17 @@ custom_mappings:
 	}
 }
 
-func TestHandlePluginCallReconfigureSelectsRewriteScope(t *testing.T) {
+func TestHandlePluginCallReconfigureSelectsScope(t *testing.T) {
 	defer restoreDefaultFilterConfig(t)
 	for _, tt := range []struct {
 		config string
 		valid  bool
 	}{
-		{config: "mode: rewrite\nrewrite_scope: [user, tool_results]", valid: true},
-		{config: "mode: rewrite\nrewrite_scope: [invalid]"},
-		{config: "mode: rewrite\nrewrite_scope: [true]"},
-		{config: "mode: rewrite\nrewrite_scope: system"},
+		{config: "mode: rewrite\nrewrite_scope: [user, tool_results, tool_descriptions]", valid: true},
+		{config: "mode: rewrite\nscope: [user, tool_results, tool_descriptions]\nrewrite_scope: [system]", valid: true},
+		{config: "mode: rewrite\nscope: [invalid]\nrewrite_scope: [system]"},
+		{config: "mode: rewrite\nscope: [true]"},
+		{config: "mode: rewrite\nscope: system"},
 	} {
 		t.Run(tt.config, func(t *testing.T) {
 			var lifecycle struct {
@@ -178,7 +179,7 @@ func TestHandlePluginCallReconfigureSelectsRewriteScope(t *testing.T) {
 				t.Fatalf("unexpected reconfigure response, code = %d, body = %s", code, raw)
 			}
 
-			const body = `{"system":"Codex","messages":[{"role":"user","content":"Codex"},{"role":"assistant","content":"Codex"},{"role":"tool","content":"Codex"}]}`
+			const body = `{"system":"Codex","messages":[{"role":"user","content":"Codex"},{"role":"assistant","content":"Codex"},{"role":"tool","content":"Codex"}],"tools":[{"type":"function","function":{"name":"Codex","description":"Codex"}}]}`
 			var intercepted struct {
 				OK     bool `json:"ok"`
 				Result struct {
@@ -190,7 +191,7 @@ func TestHandlePluginCallReconfigureSelectsRewriteScope(t *testing.T) {
 			if code != 0 || !intercepted.OK {
 				t.Fatalf("unexpected interceptor response, code = %d, body = %s", code, raw)
 			}
-			const want = `{"system":"Codex","messages":[{"role":"user","content":"Antigravity"},{"role":"assistant","content":"Codex"},{"role":"tool","content":"Antigravity"}]}`
+			const want = `{"system":"Codex","messages":[{"role":"user","content":"Antigravity"},{"role":"assistant","content":"Codex"},{"role":"tool","content":"Antigravity"}],"tools":[{"type":"function","function":{"name":"Codex","description":"Antigravity"}}]}`
 			assertRequestJSON(t, intercepted.Result.Body, want)
 		})
 	}
@@ -323,6 +324,51 @@ func TestHandlePluginCallRequestInterceptAfterBlocksEligibleAntigravityRequests(
 	}
 	if !strings.Contains(string(body), blockErrorCode) {
 		t.Fatalf("response body = %s, want block error", body)
+	}
+}
+
+func TestHandlePluginCallRequestInterceptAfterBlocksSelectedScope(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	const toolDescription = `{"request":{"tools":[{"functionDeclarations":[{"name":"lookup","description":"Codex"}]}]}}`
+	const systemPrompt = `{"request":{"systemInstruction":{"parts":[{"text":"Codex"}]}}}`
+	tests := []struct {
+		name   string
+		config string
+		body   string
+		block  bool
+	}{
+		{"default scope", "", toolDescription, false},
+		{"tool descriptions", "scope: [tool_descriptions]", toolDescription, true},
+		{"multiple blocks", "scope: [user, tool_descriptions]", `{"messages":[{"role":"user","content":"Codex"}]}`, true},
+		{"excluded system prompt", "scope: [tool_descriptions]", systemPrompt, false},
+		{"empty scope", "scope: []", systemPrompt, false},
+		{"legacy key in block mode", "rewrite_scope: [tool_descriptions]", systemPrompt, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var lifecycle struct{ OK bool }
+			raw, code := handlePluginCall("plugin.reconfigure", lifecycleRequestJSON(t, []byte("mode: block\n"+tt.config)))
+			mustUnmarshalJSON(t, raw, &lifecycle)
+			if code != 0 || !lifecycle.OK {
+				t.Fatalf("unexpected reconfigure response, code = %d, body = %s", code, raw)
+			}
+
+			var intercepted struct {
+				OK     bool
+				Result struct {
+					Terminate  bool
+					StatusCode int
+				}
+			}
+			raw, code = handlePluginCall("request.intercept_after", requestInterceptRequestJSONForFormat(t, "antigravity", tt.body))
+			mustUnmarshalJSON(t, raw, &intercepted)
+			if code != 0 || !intercepted.OK || intercepted.Result.Terminate != tt.block {
+				t.Fatalf("unexpected interceptor response, code = %d, body = %s", code, raw)
+			}
+			if tt.block && intercepted.Result.StatusCode != 403 {
+				t.Fatalf("status = %d, want 403", intercepted.Result.StatusCode)
+			}
+		})
 	}
 }
 

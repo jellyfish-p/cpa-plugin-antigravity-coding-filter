@@ -59,7 +59,7 @@ const abiVersion = 1
 
 const (
 	pluginName       = "antigravity-coding-filter"
-	pluginVersion    = "0.3.2"
+	pluginVersion    = "0.3.3"
 	pluginRepository = "https://github.com/jellyfish-p/cpa-plugin-antigravity-coding-filter"
 )
 
@@ -207,9 +207,9 @@ func configFields() []pluginapi.ConfigField {
 			Description: "How matched requests are handled: block rejects the request (default); rewrite replaces matched names with Antigravity.",
 		},
 		{
-			Name:        "rewrite_scope",
+			Name:        "scope",
 			Type:        pluginapi.ConfigFieldTypeArray,
-			Description: fmt.Sprintf("Select any combination of %s. Defaults to [\"system\"]. Only used in rewrite mode.", strings.Join(rewriteBlockNames(), ", ")),
+			Description: fmt.Sprintf("Select any combination of %s for block and rewrite modes. Defaults to [\"system\"]. An empty list disables matching.", strings.Join(scopeBlockNames(), ", ")),
 		},
 		{
 			Name:        "use_default_keywords",
@@ -219,7 +219,7 @@ func configFields() []pluginapi.ConfigField {
 		{
 			Name:        "custom_mappings",
 			Type:        pluginapi.ConfigFieldTypeObject,
-			Description: "Additional case-insensitive mappings. Block mode checks keys in system/developer prompts. Rewrite mode replaces keys in the selected rewrite scope.",
+			Description: "Additional case-insensitive mappings for the selected scope. Block mode checks keys. Rewrite mode replaces keys with their values.",
 		},
 	}
 }
@@ -404,20 +404,21 @@ const (
 	filterModeRewrite filterMode = "rewrite"
 )
 
-type rewriteBlock string
+type scopeBlock string
 
 const (
-	rewriteSystem      rewriteBlock = "system"
-	rewriteUser        rewriteBlock = "user"
-	rewriteAssistant   rewriteBlock = "assistant"
-	rewriteToolResults rewriteBlock = "tool_results"
+	scopeSystem           scopeBlock = "system"
+	scopeUser             scopeBlock = "user"
+	scopeAssistant        scopeBlock = "assistant"
+	scopeToolResults      scopeBlock = "tool_results"
+	scopeToolDescriptions scopeBlock = "tool_descriptions"
 )
 
-var rewriteBlocks = []rewriteBlock{rewriteSystem, rewriteUser, rewriteAssistant, rewriteToolResults}
+var scopeBlocks = []scopeBlock{scopeSystem, scopeUser, scopeAssistant, scopeToolResults, scopeToolDescriptions}
 
-func rewriteBlockNames() []string {
-	names := make([]string, 0, len(rewriteBlocks))
-	for _, block := range rewriteBlocks {
+func scopeBlockNames() []string {
+	names := make([]string, 0, len(scopeBlocks))
+	for _, block := range scopeBlocks {
 		names = append(names, string(block))
 	}
 	return names
@@ -431,7 +432,7 @@ type rewriteMapping struct {
 
 type filterConfig struct {
 	Mode               filterMode
-	RewriteScope       []rewriteBlock
+	Scope              []scopeBlock
 	UseDefaultKeywords bool
 	CustomMappings     []rewriteMapping
 }
@@ -451,7 +452,7 @@ func applyFilterConfig(cfg filterConfig) {
 
 	currentFilterConfig = filterConfig{
 		Mode:               cfg.Mode,
-		RewriteScope:       slices.Clone(cfg.RewriteScope),
+		Scope:              slices.Clone(cfg.Scope),
 		UseDefaultKeywords: cfg.UseDefaultKeywords,
 		CustomMappings:     append([]rewriteMapping(nil), normalizeMappings(cfg.CustomMappings)...),
 	}
@@ -463,7 +464,7 @@ func activeFilterConfig() filterConfig {
 
 	return filterConfig{
 		Mode:               currentFilterConfig.Mode,
-		RewriteScope:       slices.Clone(currentFilterConfig.RewriteScope),
+		Scope:              slices.Clone(currentFilterConfig.Scope),
 		UseDefaultKeywords: currentFilterConfig.UseDefaultKeywords,
 		CustomMappings:     append([]rewriteMapping(nil), currentFilterConfig.CustomMappings...),
 	}
@@ -501,12 +502,21 @@ func parseFilterConfigYAML(raw []byte) (filterConfig, error) {
 			return filterConfig{}, fmt.Errorf("mode must be one of: block, rewrite")
 		}
 	}
-	if value, exists := values["rewrite_scope"]; exists {
-		scope, err := parseRewriteScope(value)
+	scopeKey := "scope"
+	scopeValue, hasScope := values[scopeKey]
+	if !hasScope {
+		scopeKey = "rewrite_scope"
+		scopeValue, hasScope = values[scopeKey]
+	}
+	if hasScope {
+		scope, err := parseScope(scopeKey, scopeValue)
 		if err != nil {
 			return filterConfig{}, err
 		}
-		cfg.RewriteScope = scope
+		// The legacy setting only selected fields in rewrite mode.
+		if scopeKey == "scope" || cfg.Mode == filterModeRewrite {
+			cfg.Scope = scope
+		}
 	}
 	if value, exists := values["use_default_keywords"]; exists {
 		boolValue, ok := value.(bool)
@@ -525,20 +535,20 @@ func parseFilterConfigYAML(raw []byte) (filterConfig, error) {
 	return cfg, nil
 }
 
-func parseRewriteScope(value any) ([]rewriteBlock, error) {
+func parseScope(key string, value any) ([]scopeBlock, error) {
 	items, ok := value.([]any)
 	if !ok {
-		return nil, fmt.Errorf("rewrite_scope must be an array")
+		return nil, fmt.Errorf("%s must be an array", key)
 	}
-	scope := make([]rewriteBlock, 0, len(items))
+	scope := make([]scopeBlock, 0, len(items))
 	for _, item := range items {
 		name, ok := item.(string)
 		if !ok {
-			return nil, fmt.Errorf("rewrite_scope entries must be strings")
+			return nil, fmt.Errorf("%s entries must be strings", key)
 		}
-		block := rewriteBlock(strings.ToLower(strings.TrimSpace(name)))
-		if !slices.Contains(rewriteBlocks, block) {
-			return nil, fmt.Errorf("unknown rewrite_scope entry %q, choose from %s", name, strings.Join(rewriteBlockNames(), ", "))
+		block := scopeBlock(strings.ToLower(strings.TrimSpace(name)))
+		if !slices.Contains(scopeBlocks, block) {
+			return nil, fmt.Errorf("unknown %s entry %q, choose from %s", key, name, strings.Join(scopeBlockNames(), ", "))
 		}
 		if !slices.Contains(scope, block) {
 			scope = append(scope, block)
@@ -601,15 +611,15 @@ func parseMappingString(value string) ([]rewriteMapping, error) {
 	return mappings, nil
 }
 
-func effectiveMappings(cfg filterConfig, block rewriteBlock) []rewriteMapping {
+func effectiveMappings(cfg filterConfig, block scopeBlock) []rewriteMapping {
 	if !cfg.UseDefaultKeywords {
 		return normalizeMappings(cfg.CustomMappings)
 	}
-	if len(cfg.CustomMappings) == 0 && block != rewriteSystem {
+	if len(cfg.CustomMappings) == 0 && block != scopeSystem {
 		return defaultRewriteMappings
 	}
 	mappings := slices.Clone(defaultRewriteMappings)
-	if block == rewriteSystem {
+	if block == scopeSystem {
 		mappings = append(mappings, defaultSystemPromptMappings...)
 	}
 	mappings = append(mappings, cfg.CustomMappings...)
@@ -667,18 +677,19 @@ func classifyRequestWithConfig(body []byte, cfg filterConfig) filterDecision {
 		return filterDecision{}
 	}
 
-	mappings := effectiveMappings(cfg, rewriteSystem)
 	var decision filterDecision
-	transform := func(text string) (string, bool) {
+	transforms := scopeTransforms(cfg, func(block scopeBlock, text string, mappings []rewriteMapping) (string, bool) {
 		if decision.Blocked {
 			return text, false
 		}
 		if mapping, found := findEligibleMapping(text, mappings); found {
-			decision = filterDecision{Blocked: true, Signal: "system.keyword", Detail: mapping.Match}
+			decision = filterDecision{Blocked: true, Signal: string(block) + ".keyword", Detail: mapping.Match}
 		}
 		return text, false
+	})
+	if len(transforms) > 0 {
+		transformPromptObject(root, transforms)
 	}
-	transformPromptObject(root, map[rewriteBlock]promptTransform{rewriteSystem: transform})
 	return decision
 }
 
@@ -693,19 +704,9 @@ func rewriteRequestBodyWithConfig(body []byte, cfg filterConfig) ([]byte, bool) 
 	if err := decoder.Decode(&root); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return nil, false
 	}
-	scope := cfg.RewriteScope
-	if scope == nil {
-		scope = []rewriteBlock{rewriteSystem}
-	}
-	transforms := make(map[rewriteBlock]promptTransform, len(scope))
-	for _, block := range scope {
-		mappings := effectiveMappings(cfg, block)
-		if len(mappings) > 0 {
-			transforms[block] = func(text string) (string, bool) {
-				return rewritePromptText(text, mappings)
-			}
-		}
-	}
+	transforms := scopeTransforms(cfg, func(_ scopeBlock, text string, mappings []rewriteMapping) (string, bool) {
+		return rewritePromptText(text, mappings)
+	})
 	if len(transforms) == 0 || !transformPromptObject(root, transforms) {
 		return nil, false
 	}
@@ -714,6 +715,23 @@ func rewriteRequestBodyWithConfig(body []byte, cfg filterConfig) ([]byte, bool) 
 		return nil, false
 	}
 	return raw, true
+}
+
+func scopeTransforms(cfg filterConfig, visit func(scopeBlock, string, []rewriteMapping) (string, bool)) map[scopeBlock]promptTransform {
+	scope := cfg.Scope
+	if scope == nil {
+		scope = []scopeBlock{scopeSystem}
+	}
+	transforms := make(map[scopeBlock]promptTransform, len(scope))
+	for _, block := range scope {
+		mappings := effectiveMappings(cfg, block)
+		if len(mappings) > 0 {
+			transforms[block] = func(text string) (string, bool) {
+				return visit(block, text, mappings)
+			}
+		}
+	}
+	return transforms
 }
 
 // These helpers keep the original classifier/rewrite seams available to
@@ -785,13 +803,13 @@ type promptTransform func(string) (string, bool)
 
 // The traversal follows protocol-defined text fields and the Antigravity
 // request wrapper, preserving structural fields such as tool-call identifiers.
-func transformPromptObject(value any, transforms map[rewriteBlock]promptTransform) bool {
+func transformPromptObject(value any, transforms map[scopeBlock]promptTransform) bool {
 	object, ok := value.(map[string]any)
 	if !ok {
 		return false
 	}
 	changed := false
-	if transform := transforms[rewriteSystem]; transform != nil {
+	if transform := transforms[scopeSystem]; transform != nil {
 		for _, key := range []string{"system", "instructions"} {
 			child, exists := object[key]
 			if !exists {
@@ -816,7 +834,7 @@ func transformPromptObject(value any, transforms map[rewriteBlock]promptTransfor
 		}
 	}
 
-	if transformTextField(object, "input", transforms[rewriteUser]) {
+	if transformTextField(object, "input", transforms[scopeUser]) {
 		changed = true
 	}
 	for _, field := range []string{"input", "messages"} {
@@ -825,6 +843,9 @@ func transformPromptObject(value any, transforms map[rewriteBlock]promptTransfor
 		}
 	}
 	if transformGeminiMessages(object["contents"], transforms) {
+		changed = true
+	}
+	if transformToolDescriptions(object, transforms[scopeToolDescriptions]) {
 		changed = true
 	}
 	if transformPromptObject(object["request"], transforms) {
@@ -860,7 +881,7 @@ func transformPromptTextContainer(value any, transform func(string) (string, boo
 	return value, false
 }
 
-func transformRoleMessages(value any, transforms map[rewriteBlock]promptTransform) bool {
+func transformRoleMessages(value any, transforms map[scopeBlock]promptTransform) bool {
 	switch typed := value.(type) {
 	case []any:
 		changed := false
@@ -877,24 +898,24 @@ func transformRoleMessages(value any, transforms map[rewriteBlock]promptTransfor
 	}
 }
 
-func transformRoleMessage(value any, transforms map[rewriteBlock]promptTransform) bool {
+func transformRoleMessage(value any, transforms map[scopeBlock]promptTransform) bool {
 	message, ok := value.(map[string]any)
 	if !ok {
 		return false
 	}
 	if itemType := normalizedJSONField(message, "type"); itemType == "function_call_output" || itemType == "custom_tool_call_output" {
-		return transformContentField(message, "output", transforms[rewriteToolResults], false)
+		return transformContentField(message, "output", transforms[scopeToolResults], false)
 	}
 	switch normalizedJSONField(message, "role") {
 	case "system", "developer":
-		return transformContentField(message, "content", transforms[rewriteSystem], false)
+		return transformContentField(message, "content", transforms[scopeSystem], false)
 	case "assistant":
-		return transformContentField(message, "content", transforms[rewriteAssistant], true)
+		return transformContentField(message, "content", transforms[scopeAssistant], true)
 	case "tool", "function":
-		return transformContentField(message, "content", transforms[rewriteToolResults], false)
+		return transformContentField(message, "content", transforms[scopeToolResults], false)
 	case "user":
-		changed := transformContentField(message, "content", transforms[rewriteUser], false)
-		if transform := transforms[rewriteToolResults]; transform != nil {
+		changed := transformContentField(message, "content", transforms[scopeUser], false)
+		if transform := transforms[scopeToolResults]; transform != nil {
 			blocks, _ := message["content"].([]any)
 			for _, child := range blocks {
 				block, _ := child.(map[string]any)
@@ -957,6 +978,43 @@ func transformTextField(object map[string]any, field string, transform promptTra
 	return changed
 }
 
+func transformToolDescriptions(request map[string]any, transform promptTransform) bool {
+	if transform == nil {
+		return false
+	}
+
+	changed := transformFunctionDescriptions(request["functions"], transform)
+	tools, _ := request["tools"].([]any)
+	for _, entry := range tools {
+		tool, _ := entry.(map[string]any)
+		if transformTextField(tool, "description", transform) {
+			changed = true
+		}
+		function, _ := tool["function"].(map[string]any)
+		if transformTextField(function, "description", transform) {
+			changed = true
+		}
+		for _, key := range []string{"functionDeclarations", "function_declarations"} {
+			if transformFunctionDescriptions(tool[key], transform) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func transformFunctionDescriptions(value any, transform promptTransform) bool {
+	functions, _ := value.([]any)
+	changed := false
+	for _, entry := range functions {
+		function, _ := entry.(map[string]any)
+		if transformTextField(function, "description", transform) {
+			changed = true
+		}
+	}
+	return changed
+}
+
 func transformMessageTextBlock(block map[string]any, transform promptTransform, allowOutputText bool) bool {
 	switch normalizedJSONField(block, "type") {
 	case "text", "input_text":
@@ -968,10 +1026,10 @@ func transformMessageTextBlock(block map[string]any, transform promptTransform, 
 	}
 }
 
-func transformGeminiMessages(value any, transforms map[rewriteBlock]promptTransform) bool {
-	userTransform := transforms[rewriteUser]
-	assistantTransform := transforms[rewriteAssistant]
-	toolTransform := transforms[rewriteToolResults]
+func transformGeminiMessages(value any, transforms map[scopeBlock]promptTransform) bool {
+	userTransform := transforms[scopeUser]
+	assistantTransform := transforms[scopeAssistant]
+	toolTransform := transforms[scopeToolResults]
 	if userTransform == nil && assistantTransform == nil && toolTransform == nil {
 		return false
 	}

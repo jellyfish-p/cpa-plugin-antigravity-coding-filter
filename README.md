@@ -7,7 +7,7 @@ CLIProxyAPI v7 dynamic plugin for blocking or rewriting non-Antigravity coding s
 The plugin inspects requests after CLIProxyAPI has selected the upstream format. The `mode` setting controls how the plugin handles matches.
 
 - `block` (default): reject the entire request with HTTP `403 Forbidden` and a `blocked_by_antigravity_coding_filter` error.
-- `rewrite`: replace matched names in the selected text blocks and forward the request. The default scope is system/developer prompts.
+- `rewrite`: replace matched names in the selected text blocks and forward the request.
 
 Matching is case-insensitive. Both modes support these system/developer prompt locations.
 
@@ -37,9 +37,9 @@ The built-in preset is enabled by default and covers major AI coding editors, as
 - OpenClaw (including Clawdbot and Moltbot), Hermes Agent, WorkBuddy
 - DeepSeek Harness (`dsh`) and Pi coding agent, using identity phrases from their default system prompts. [DeepSeek Harness prompt snapshot](https://github.com/deepseek-ai/deepseek-harness/blob/2e39e70496aa02986ca6a820c5d497e816b69d7e/snapshots/sdk/text-turn/system-prompt.expected.md), [Pi prompt builder](https://github.com/earendil-works/pi/blob/63dec2621d3cb2e1f4d7cefd6df061e78c6de979/packages/coding-agent/src/core/system-prompt.ts)
 
-## Rewrite Scope
+## Scope
 
-Set `rewrite_scope` to a list of any combination of these options. Omit it for `[system]` or use `[]` to disable rewriting. Block mode always checks system/developer prompts.
+Set `scope` to any combination of the text blocks below. Both `block` and `rewrite` check the selected blocks. Omit `scope` to use `[system]` or set it to `[]` to disable matching.
 
 | Option | Text selected |
 | --- | --- |
@@ -47,14 +47,15 @@ Set `rewrite_scope` to a list of any combination of these options. Omit it for `
 | `user` | User message text and OpenAI Responses string `input` |
 | `assistant` | Assistant or Gemini `model` message text |
 | `tool_results` | Tool and function message text, Anthropic `tool_result` content, OpenAI Responses output items, and Gemini function result text |
+| `tool_descriptions` | `description` in Anthropic and OpenAI Responses tool definitions, Chat Completions function definitions, and Gemini function declarations |
 
-Text carried in a plain Gemini user part is covered by `user`. The `tool_results` option covers text in explicitly structured function responses or tool messages. A tool result delivered as a string is processed as text, including a string containing serialized JSON. Tool definitions, protocol-level call identifiers, function names and arguments, images, metadata, and structured result fields outside the supported text locations are preserved.
+Text carried in a plain Gemini user part is covered by `user`. The `tool_results` option covers text in explicitly structured function responses or tool messages. A tool result delivered as a string is processed as text, including a string containing serialized JSON. The `tool_descriptions` option applies the configured mappings to each tool's own description. Tool names, parameter schemas, protocol-level call identifiers, function arguments, images, metadata, and structured result fields outside the supported text locations are preserved.
 
-The CLIProxyAPI Management Center edits array settings as JSON. Enter a list such as `["system", "user", "tool_results"]` in the `rewrite_scope` field, or set the same options in YAML.
+The CLIProxyAPI Management Center edits array settings as JSON. Enter a list such as `["system", "tool_descriptions"]` in the `scope` field, or set the same options in YAML. Existing `rewrite_scope` settings still apply in `rewrite` mode when `scope` is omitted.
 
 ## Mapping Configuration
 
-The plugin config can select rewrite mode and its scope, disable the built-in preset, and provide custom mappings.
+The plugin config can select a mode and scope, disable the built-in preset, and provide custom mappings.
 
 ```yaml
 plugins:
@@ -63,7 +64,7 @@ plugins:
       enabled: true
       priority: 1
       mode: rewrite
-      rewrite_scope: [system, user, tool_results]
+      scope: [system, user, tool_results, tool_descriptions]
       use_default_keywords: false
       custom_mappings:
         Cursor: Antigravity
@@ -97,6 +98,7 @@ plugins:
       enabled: true
       priority: 1
       mode: block
+      scope: [system]
       use_default_keywords: true
       custom_mappings: {}
 ```

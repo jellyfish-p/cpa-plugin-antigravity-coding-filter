@@ -214,7 +214,7 @@ func TestRewriteScopeSelectsTextBlocksIndependently(t *testing.T) {
 			{"role":"assistant","content":[{"type":"output_text","text":"assistant Sample product"}],"tool_calls":[{"id":"Sample product","function":{"name":"Sample product","arguments":"Sample product"}}]},
 			{"role":"tool","tool_call_id":"Sample product","content":"tool_results Sample product"}
 		],
-		"tools":[{"type":"function","function":{"description":"Sample product"}}],
+		"tools":[{"type":"function","function":{"description":"tool_descriptions Sample product"}}],
 		"metadata":{"tag":"Sample product","n":9007199254740993}
 	}`
 	tests := []struct {
@@ -223,9 +223,10 @@ func TestRewriteScopeSelectsTextBlocksIndependently(t *testing.T) {
 		blocks []string
 	}{
 		{"omitted", "", []string{"system"}},
-		{"empty", "rewrite_scope: []", nil},
-		{"user and assistant", "rewrite_scope: [' User ', assistant, user]", []string{"user", "assistant"}},
-		{"all", "rewrite_scope: [system, user, assistant, tool_results]", []string{"system", "user", "assistant", "tool_results"}},
+		{"empty", "scope: []", nil},
+		{"user and assistant", "scope: [' User ', assistant, user]", []string{"user", "assistant"}},
+		{"tool descriptions only", "scope: [tool_descriptions]", []string{"tool_descriptions"}},
+		{"all", "scope: [system, user, assistant, tool_results, tool_descriptions]", []string{"system", "user", "assistant", "tool_results", "tool_descriptions"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -237,6 +238,9 @@ func TestRewriteScopeSelectsTextBlocksIndependently(t *testing.T) {
 			if rewritten != (len(tt.blocks) > 0) {
 				t.Fatalf("rewritten = %v for config %q", rewritten, tt.config)
 			}
+			if decision := classifyRequestWithConfig([]byte(request), cfg); decision.Blocked != rewritten {
+				t.Fatalf("blocked = %v, want %v for config %q", decision.Blocked, rewritten, tt.config)
+			}
 			if !rewritten {
 				return
 			}
@@ -247,6 +251,50 @@ func TestRewriteScopeSelectsTextBlocksIndependently(t *testing.T) {
 			assertRequestJSON(t, got, want)
 			if !strings.Contains(string(got), `"n":9007199254740993`) {
 				t.Fatalf("large number changed in %s", got)
+			}
+		})
+	}
+}
+
+func TestRewriteScopeCoversProtocolToolDescriptions(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "Chat Completions tools",
+			body: `{"tools":[{"type":"function","function":{"name":"Codex","description":"description Codex","parameters":{"type":"object","properties":{"query":{"type":"string","description":"parameter Codex"}}}}}],"tool_choice":{"type":"function","function":{"name":"Codex"}},"messages":[{"role":"assistant","tool_calls":[{"id":"Codex","type":"function","function":{"name":"Codex","arguments":"{}"}}]}]}`,
+		},
+		{
+			name: "Chat Completions legacy functions",
+			body: `{"functions":[{"name":"Codex","description":"description Codex","parameters":{"type":"object","description":"parameter Codex"}}],"function_call":{"name":"Codex"}}`,
+		},
+		{
+			name: "Responses tools",
+			body: `{"tools":[{"type":"function","name":"Codex","description":"description Codex","parameters":{"type":"object","description":"parameter Codex"}},{"type":"custom","name":"tool","description":"description Codex"}],"input":[{"type":"function_call_output","call_id":"Codex","output":"result Codex"}]}`,
+		},
+		{
+			name: "Anthropic tools",
+			body: `{"tools":[{"name":"Codex","description":"description Codex","input_schema":{"type":"object","description":"parameter Codex"}}],"metadata":{"description":"metadata Codex","tools":[{"description":"metadata Codex"}]}}`,
+		},
+		{
+			name: "Gemini tools in Antigravity request wrapper",
+			body: `{"request":{"tools":[{"functionDeclarations":[{"name":"Codex","description":"description Codex","parameters":{"type":"object","description":"parameter Codex"}}]},{"function_declarations":[{"name":"Codex","description":"description Codex"}]},{"googleSearch":{}}]}}`,
+		},
+	}
+	cfg, err := parseFilterConfigYAML([]byte("mode: rewrite\nscope: [tool_descriptions]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, rewritten := rewriteRequestBodyWithConfig([]byte(tt.body), cfg)
+			if !rewritten {
+				t.Fatal("tool description was not rewritten")
+			}
+			assertRequestJSON(t, got, strings.ReplaceAll(tt.body, "description Codex", "description Antigravity"))
+			if decision := classifyRequestWithConfig([]byte(tt.body), cfg); !decision.Blocked || decision.Signal != "tool_descriptions.keyword" {
+				t.Fatalf("tool description should trigger a block: %#v", decision)
 			}
 		})
 	}
@@ -271,7 +319,7 @@ func TestRewriteScopeCoversProtocolToolResultText(t *testing.T) {
 		},
 	}
 	cfg := defaultFilterConfig()
-	cfg.RewriteScope = []rewriteBlock{rewriteToolResults}
+	cfg.Scope = []scopeBlock{scopeToolResults}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, rewritten := rewriteRequestBodyWithConfig([]byte(tt.body), cfg)
@@ -279,8 +327,8 @@ func TestRewriteScopeCoversProtocolToolResultText(t *testing.T) {
 				t.Fatal("tool result text was not rewritten")
 			}
 			assertRequestJSON(t, got, strings.ReplaceAll(tt.body, "result Codex", "result Antigravity"))
-			if classifyRequestWithConfig([]byte(tt.body), cfg).Blocked {
-				t.Fatal("rewrite scope affected block mode")
+			if decision := classifyRequestWithConfig([]byte(tt.body), cfg); !decision.Blocked || decision.Signal != "tool_results.keyword" {
+				t.Fatalf("tool result should trigger a block: %#v", decision)
 			}
 		})
 	}
@@ -289,7 +337,7 @@ func TestRewriteScopeCoversProtocolToolResultText(t *testing.T) {
 func TestRewriteScopeCoversGeminiMessageText(t *testing.T) {
 	const body = `{"request":{"contents":[{"role":"user","parts":[{"text":"Codex user"},{"functionResponse":{"response":{"result":"Codex result"}}}]},{"parts":[{"text":"Codex user"}]},{"role":"model","parts":[{"text":"Codex model"},{"thought":true,"text":"Codex thought"}]}]}}`
 	cfg := defaultFilterConfig()
-	cfg.RewriteScope = []rewriteBlock{rewriteUser, rewriteAssistant}
+	cfg.Scope = []scopeBlock{scopeUser, scopeAssistant}
 	got, rewritten := rewriteRequestBodyWithConfig([]byte(body), cfg)
 	if !rewritten {
 		t.Fatal("Gemini user and model text was not rewritten")
@@ -300,7 +348,7 @@ func TestRewriteScopeCoversGeminiMessageText(t *testing.T) {
 
 func TestRewriteScopePreservesUnicodeBeforeMatches(t *testing.T) {
 	cfg := defaultFilterConfig()
-	cfg.RewriteScope = []rewriteBlock{rewriteUser}
+	cfg.Scope = []scopeBlock{scopeUser}
 	body := []byte(`{"input":"Kelvin mentioned Codex near https://example.test/Codex."}`)
 	got, rewritten := rewriteRequestBodyWithConfig(body, cfg)
 	if !rewritten {
@@ -319,7 +367,7 @@ func TestSystemPromptPresetsDetectDeepSeekHarnessAndPi(t *testing.T) {
 		{"You are a coding assistant running inside PI, a coding agent harness.", "You are a coding assistant running inside Antigravity, a coding agent harness."},
 	}
 	cfg := defaultFilterConfig()
-	cfg.RewriteScope = []rewriteBlock{rewriteSystem, rewriteUser}
+	cfg.Scope = []scopeBlock{scopeSystem, scopeUser}
 	for _, tt := range tests {
 		t.Run(tt.prompt, func(t *testing.T) {
 			body := `{"system":"` + tt.prompt + `","input":"` + tt.prompt + `"}`
